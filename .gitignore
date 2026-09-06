@@ -23,6 +23,13 @@ __pycache__/
 *.pycutils/.env
 data/
 
+# Validator-rejected skill drafts. The train pipeline saves failed
+# runs here so we can inspect them, but they should never enter the
+# repo: they're known-bad and the validator already replaced them
+# with the fallback_generic_fix.md.
+*.hallucinated.*
+agent/skills/**/*.hallucinated.*
+
 # Local plaintext scratch — contains secrets / chat history, NEVER track.
 history.txt
 *.local.txt
