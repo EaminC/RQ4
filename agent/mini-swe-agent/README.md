@@ -31,8 +31,16 @@ one, so accidental edits inside `upstream/` are surfaced loudly.
 ## Bootstrap
 
 ```bash
-./setup.sh
+./setup.sh           # fetch latest main + install + smoke test
+./setup.sh --no-update   # skip GitHub lookup; reuse existing upstream/
 ```
+
+The default run always pins `./upstream/` to whatever SHA `main` of
+`SWE-agent/mini-swe-agent` currently points at on GitHub. If the local
+checkout has drifted (e.g. you made edits, or upstream advanced), setup.sh
+fetches and `git reset --hard`s back to the official SHA — so `./upstream/`
+is always a pristine copy. Use `--no-update` if you want to keep working
+with a known local SHA.
 
 ## Running the agent
 

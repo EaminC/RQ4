@@ -9,16 +9,23 @@
 # smoke_test.py), one level above upstream/.
 #
 # What this script does, in order:
-#   1. Sanity-check tooling (git, python3, uv).
-#   2. Load or create ./secrets.env (API key, base URL, default model).
-#   3. Clone https://github.com/SWE-agent/mini-swe-agent.git into ./upstream/
-#      (refuses to touch an existing checkout with a different remote).
-#   4. Create an isolated `uv` venv in ./.venv and pip install -e the agent.
-#   5. Drop a mini.yaml that points litellm at the tu-zi OpenAI-compatible
+#   1. Sanity-check tooling (git, python3, uv, curl).
+#   2. Resolve the upstream version: query GitHub for the current main SHA
+#      (so we always pin to "latest released" rather than a stale local copy).
+#      `--no-update` skips this and reuses the existing upstream/ as-is.
+#   3. Sync ./upstream/ to that SHA (init+fetch+checkout on first run;
+#      fetch+reset on subsequent runs).
+#   4. Load or create ./secrets.env (API key, base URL, default model).
+#   5. Create an isolated `uv` venv in ./.venv and pip install -e the agent.
+#   6. Drop a mini.yaml that points litellm at the tu-zi OpenAI-compatible
 #      endpoint, plus a tiny smoke-test script.
-#   6. Run the smoke test (single chat call through mini-swe-agent).
+#   7. Run the smoke test (single chat call through mini-swe-agent).
 #
 # Re-running is safe: existing files are reused, nothing is wiped.
+#
+# Usage:
+#   ./setup.sh           # fetch latest main + install + smoke test
+#   ./setup.sh --no-update   # skip GitHub lookup; use existing upstream/
 
 set -euo pipefail
 
@@ -99,33 +106,87 @@ log "Using endpoint: $TUZI_BASE_URL"
 log "Using model:    $DEFAULT_MODEL"
 
 # ---------------------------------------------------------------------------
-# 3. Clone upstream
-#    We treat mini-swe-agent as a read-only external dependency:
-#      - it lives in ./upstream/ (gitignored, never committed)
-#      - we only ever edit files OUTSIDE ./upstream/
-#      - this block refuses to clone into a non-empty upstream/ that
-#        does not match the official remote, so we can't accidentally
-#        poison a working copy with local edits.
+# 3. Sync upstream/ to the current main of SWE-agent/mini-swe-agent
+#
+#   Strategy:
+#     a) Query GitHub for the SHA of the upstream default branch (main).
+#        No auth required (60 req/h/IP, plenty for setup scripts).
+#     b) If ./upstream/ doesn't exist yet, init it, add the official remote,
+#        fetch just that SHA, and check it out into a detached HEAD.
+#     c) If ./upstream/ already exists with the official remote, fetch the
+#        new SHA and `git reset --hard` to it so we always track "latest".
+#     d) If --no-update was passed, reuse the existing checkout as-is.
+#
+#   This means ./upstream/ is always a pristine copy of upstream at a known
+#   SHA — no untracked local edits can survive a re-run.
 # ---------------------------------------------------------------------------
 OFFICIAL_REMOTE="https://github.com/SWE-agent/mini-swe-agent.git"
+UPSTREAM_BRANCH="main"
 
-if [[ -d "$UPSTREAM_DIR/.git" ]]; then
-    existing_remote="$(git -C "$UPSTREAM_DIR" config --get remote.origin.url 2>/dev/null || echo "")"
-    if [[ "$existing_remote" != "$OFFICIAL_REMOTE" ]]; then
-        err "upstream/ already exists but its remote is '$existing_remote',"
-        err "expected '$OFFICIAL_REMOTE'. Refusing to clobber. Move it aside first."
+fetch_upstream_sha() {
+    # Returns the SHA of the upstream default branch.
+    # Uses curl + jq if available, else falls back to a python one-liner.
+    local sha
+    if command -v jq >/dev/null 2>&1; then
+        sha="$(curl -fsSL "https://api.github.com/repos/SWE-agent/mini-swe-agent/branches/$UPSTREAM_BRANCH" \
+              | jq -r '.commit.sha')"
+    else
+        sha="$(curl -fsSL "https://api.github.com/repos/SWE-agent/mini-swe-agent/branches/$UPSTREAM_BRANCH" \
+              | python3 -c 'import json,sys; print(json.load(sys.stdin)["commit"]["sha"])')"
+    fi
+    if [[ -z "$sha" || "$sha" == "null" ]]; then
+        err "Failed to resolve upstream SHA from GitHub."
+        err "Check network access to api.github.com or re-run with --no-update."
+        return 1
+    fi
+    printf '%s' "$sha"
+}
+
+if [[ "${1:-}" == "--no-update" ]]; then
+    if [[ ! -d "$UPSTREAM_DIR/.git" ]]; then
+        err "--no-update passed but $UPSTREAM_DIR has no git checkout yet."
         exit 1
     fi
-    log "Upstream already cloned at $UPSTREAM_DIR (skipping)"
+    log "Skipping upstream sync (--no-update); using existing $UPSTREAM_DIR"
 else
-    if [[ -d "$UPSTREAM_DIR" ]] && [[ -n "$(ls -A "$UPSTREAM_DIR" 2>/dev/null)" ]]; then
-        err "$UPSTREAM_DIR exists and is non-empty but is not a git checkout."
-        err "Move it aside before re-running setup.sh."
-        exit 1
+    log "Resolving upstream SHA from GitHub ($UPSTREAM_BRANCH)..."
+    TARGET_SHA="$(fetch_upstream_sha)"
+    log "Upstream main @ ${TARGET_SHA:0:12}"
+
+    if [[ -d "$UPSTREAM_DIR/.git" ]]; then
+        existing_remote="$(git -C "$UPSTREAM_DIR" config --get remote.origin.url 2>/dev/null || echo "")"
+        if [[ "$existing_remote" != "$OFFICIAL_REMOTE" ]]; then
+            err "upstream/ already exists but its remote is '$existing_remote',"
+            err "expected '$OFFICIAL_REMOTE'. Refusing to clobber. Move it aside first."
+            exit 1
+        fi
+        current_sha="$(git -C "$UPSTREAM_DIR" rev-parse HEAD 2>/dev/null || echo "")"
+        if [[ "$current_sha" == "$TARGET_SHA" ]]; then
+            log "upstream/ already at $TARGET_SHA (skipping fetch)"
+        else
+            log "Updating upstream/ $current_sha → $TARGET_SHA"
+            git -C "$UPSTREAM_DIR" fetch --depth 1 origin "$TARGET_SHA"
+            git -C "$UPSTREAM_DIR" reset --hard "$TARGET_SHA"
+        fi
+    else
+        if [[ -d "$UPSTREAM_DIR" ]] && [[ -n "$(ls -A "$UPSTREAM_DIR" 2>/dev/null)" ]]; then
+            err "$UPSTREAM_DIR exists and is non-empty but is not a git checkout."
+            err "Move it aside before re-running setup.sh."
+            exit 1
+        fi
+        log "Initializing upstream/ and fetching $TARGET_SHA"
+        mkdir -p "$UPSTREAM_DIR"
+        git -C "$UPSTREAM_DIR" init -q
+        git -C "$UPSTREAM_DIR" remote add origin "$OFFICIAL_REMOTE"
+        git -C "$UPSTREAM_DIR" fetch --depth 1 origin "$TARGET_SHA"
+        git -C "$UPSTREAM_DIR" checkout -q --detach "$TARGET_SHA"
     fi
-    log "Cloning $OFFICIAL_REMOTE → $UPSTREAM_DIR"
-    git clone --depth 1 "$OFFICIAL_REMOTE" "$UPSTREAM_DIR"
+    # Make git status / future fetches behave nicely.
+    git -C "$UPSTREAM_DIR" config advice.detachedHead false
 fi
+
+# Record what we synced so smoke_test / debugging can reference it.
+log "Upstream HEAD: $(git -C "$UPSTREAM_DIR" rev-parse --short HEAD)"
 
 # ---------------------------------------------------------------------------
 # 4. venv + install
