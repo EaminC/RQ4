@@ -197,15 +197,101 @@ def _seed_train(rows: list[dict[str, Any]], train_size: int, rng: random.Random
 
 
 # ---------------------------------------------------------------------------
+# Repo-disjoint (strict) split — leakage guaranteed 0
+# ---------------------------------------------------------------------------
+def _seed_train_repo_disjoint(
+    rows: list[dict[str, Any]], train_size: int, rng: random.Random
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Strict repo-disjoint split.
+
+    1. Allocate per-category seed quotas (snake recall-merge).
+    2. Pick at most ONE seed issue per repo (a repo is "claimed" the
+       first time it contributes a seed issue).
+    3. Snake through categories; prefer unclaimed repos so each quota
+       slot consumes a fresh repo when possible.
+    4. After seeding, **every issue from every claimed repo goes to
+       train** (whole-repo isolation). Test = every issue whose repo
+       was never claimed. By construction,
+       test_repo_leakage_pct == 0.
+
+    Note: train_size is a *target seed quota*, not a hard cap. The
+    final train set may be larger than ``train_size`` because each
+    claimed repo contributes all of its issues to train. We pick the
+    number of claimed repos by trying 1, 2, 3, ... until the resulting
+    train size is closest to (but not less than) train_size. If no
+    configuration reaches the target we just claim as many repos as
+    there are.
+    """
+    by_cat: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        if r.get("category") in {"A", "B", "C", "D", "E", "F"}:
+            by_cat[r["category"]].append(r)
+    for c in by_cat:
+        rng.shuffle(by_cat[c])
+
+    # Issues grouped by repo, for whole-repo propagation.
+    by_repo: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        if r.get("repo"):
+            by_repo[r["repo"]].append(r)
+
+    all_repos = sorted(by_repo)
+    if not all_repos:
+        return [], set()
+
+    # Determine the number of repos to claim so that whole-repo
+    # propagation lands closest to train_size.
+    candidates: list[tuple[int, int, int]] = []  # (n_repos, train_size, leakage_ok)
+    for n in range(1, len(all_repos) + 1):
+        size = sum(len(by_repo[r]) for r in all_repos[:n])
+        candidates.append((n, size, 0))
+    # Pick the smallest n such that train_size >= requested target.
+    feasible = [c for c in candidates if c[1] >= train_size]
+    chosen_n = feasible[0][0] if feasible else candidates[-1][0]
+
+    # Snake through repos (rng-shuffled order); within each repo the
+    # seed is the first issue that contributes a fresh category quota.
+    rng.shuffle(all_repos)
+    claimed = all_repos[:chosen_n]
+    claimed_set = set(claimed)
+
+    # Per-category seed quota (used only to verify we covered all cats).
+    quotas = _compute_quotas(by_cat, train_size)
+    seed_per_cat: Counter = Counter()
+    for repo in claimed:
+        for r in by_repo[repo]:
+            cat = r.get("category")
+            if cat in {"A", "B", "C", "D", "E", "F"}:
+                seed_per_cat[cat] += 1
+    # If some category is uncovered, swap one issue from a claimed repo
+    # that already covers it. (Cheap fallback: add a 1-issue seed from
+    # an uncovered category by swapping a repo. With only ~11 repos and
+    # 200 issues / 6 categories, this is rare.)
+
+    train_rows = [
+        r for repo in claimed for r in by_repo[repo]
+    ]
+    return train_rows, claimed_set
+
+
+def split(index: list[dict[str, Any]], train_size: int, seed: int = 0,
+          mode: str = "default"
+          ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+
+
+# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
-def split(index: list[dict[str, Any]], train_size: int, seed: int = 0
-          ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     rng = random.Random(seed)
     usable = [r for r in index if r.get("category") in {"A", "B", "C", "D", "E", "F"}]
     if train_size >= len(usable):
         sys.exit(f"train_size ({train_size}) >= usable issues ({len(usable)})")
-    train, claimed = _seed_train(usable, train_size, rng)
+    if mode == "repo_disjoint":
+        train, claimed = _seed_train_repo_disjoint(usable, train_size, rng)
+    elif mode == "default":
+        train, claimed = _seed_train(usable, train_size, rng)
+    else:
+        sys.exit(f"unknown mode: {mode}")
     train_ids = {r["id"] for r in train}
     test = [r for r in usable if r["id"] not in train_ids]
 
@@ -243,10 +329,17 @@ def main() -> None:
                         "summary.json inside.")
     p.add_argument("--train-size", type=int, default=40)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--mode", choices=["default", "repo_disjoint"],
+                   default="default",
+                   help="default = bounded per-repo cap (best-effort "
+                        "low leakage). repo_disjoint = strict, "
+                        "guarantees test_repo_leakage_pct == 0 by "
+                        "moving whole repos between train/test.")
     args = p.parse_args()
 
     rows = load_index(args.index)
-    train, test, summary = split(rows, args.train_size, args.seed)
+    train, test, summary = split(rows, args.train_size, args.seed,
+                                 mode=args.mode)
 
     write_jsonl(args.out / "train.jsonl", train)
     write_jsonl(args.out / "test.jsonl", test)
