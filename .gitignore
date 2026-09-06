@@ -1,0 +1,25 @@
+# Secrets / local config
+agent/mini-swe-agent/secrets.env
+agent/mini-swe-agent/upstream/
+agent/mini-swe-agent/.venv/
+agent/mini-swe-agent/.mswea*/
+agent/*/secrets.env
+agent/*/upstream/
+agent/*/.venv/
+agent/*/.mswea*/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
