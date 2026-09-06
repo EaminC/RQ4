@@ -74,24 +74,59 @@ def _materialise_issues(
     """Copy each issue dir's payload into ``dest_root/issues/<id>/``.
 
     Returns a list of ``(issue_id, dest_dir)`` for the prompts to reference.
+
+    Source-dir contents vary across the dataset; we copy whatever is
+    available and rename to a stable layout for the agent. The renamed
+    set is documented to the agent in the prompt, so a missing
+    ``patch.diff`` is recoverable (the issue body + f2p test still tell
+    most of the fix story).
+
+    Source name         → dest name         (always)
+    ------------------- ----------------------
+    issue_<id>.json     → issue.json
+    agentsmith_fail2pass_<id>.py
+                        → fail2pass_test.py
+    generated_patch.diff → patch.diff        (may be absent)
+    f2p.txt             → f2p.txt
+    summary.json        → summary.json
+    agentsmith_stat.json → agentsmith_stat.json
+    run.log             → run.log
+    env.dockerfile      → env.dockerfile
     """
     out: list[tuple[str, Path]] = []
     for src in src_dirs:
         iid = prompt_mod.issue_id_from_path(src)
         dest = dest_root / "issues" / iid
         dest.mkdir(parents=True, exist_ok=True)
-        for fname, newname in [
-            ("issue.json", None),
-            ("generated_patch.diff", "patch.diff"),
-            ("f2p.txt", None),
-            ("summary.json", None),
-            ("issue_*.json", None),     # some repos store extra metadata
-        ]:
-            for f in src.glob(fname):
-                target = dest / (newname or f.name)
-                if f.resolve() == target.resolve():
-                    continue
-                shutil.copy2(f, target)
+
+        rename_map = {
+            f"issue_{iid}.json": "issue.json",
+            f"agentsmith_fail2pass_{iid}.py": "fail2pass_test.py",
+            "generated_patch.diff": "patch.diff",
+            "f2p.txt": "f2p.txt",
+            "summary.json": "summary.json",
+            "agentsmith_stat.json": "agentsmith_stat.json",
+            "run.log": "run.log",
+            "env.dockerfile": "env.dockerfile",
+        }
+        for src_name, dest_name in rename_map.items():
+            src_file = src / src_name
+            if not src_file.exists():
+                continue
+            target = dest / dest_name
+            if src_file.resolve() == target.resolve():
+                continue
+            shutil.copy2(src_file, target)
+
+        # If a patch.diff didn't exist, leave a NOTE so the agent knows.
+        if not (dest / "patch.diff").exists():
+            (dest / "PATCH_MISSING.txt").write_text(
+                "No generated_patch.diff in the source directory for this "
+                "issue. The training data for this issue only includes the "
+                "issue body (issue.json) and the failing test "
+                "(fail2pass_test.py). Distill the fix pattern from those.\n",
+                encoding="utf-8",
+            )
         out.append((iid, dest))
     return out
 
@@ -179,6 +214,7 @@ def _write_manifest(
     actual_train_size: int,
     repos: list[str],
     issues_per_repo: dict[str, int],
+    single_issue: str | None = None,
 ) -> None:
     rel_skill_dir = (
         str(skill_dir.relative_to(REPO_ROOT))
@@ -196,6 +232,9 @@ def _write_manifest(
         "total_issues_for_skill": sum(issues_per_repo.values()),
         "skill_dir": rel_skill_dir,
     }
+    if single_issue is not None:
+        manifest["single_issue"] = single_issue
+        manifest["smoke_test"] = True
     (skill_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -276,17 +315,53 @@ def main() -> None:
                    help="Print prompts only; don't invoke the agent")
     p.add_argument("--repos", nargs="*", default=None,
                    help="Restrict to a subset of repos (for debugging)")
+    p.add_argument("--single-issue", default=None,
+                   help="Skip the split: train on exactly this single "
+                        "issue id (must exist in the index). Smoke-test "
+                        "mode for verifying skill generation without "
+                        "running the full pipeline.")
+    p.add_argument("--single-repo", default=None,
+                   help="Required with --single-issue: issue ids are "
+                        "not unique across repos, so we need both.")
     args = p.parse_args()
 
     index = [json.loads(l) for l in args.index.read_text().splitlines() if l.strip()]
     print(f"[idx] {len(index)} issues loaded")
 
-    _, _, summary = split_mod.split(
-        index, args.train_size, seed=args.seed, mode=args.mode,
-    )
-    train_repos = summary["train_repos"]
-    print(f"[spl] mode={args.mode} req={args.train_size} "
-          f"actual={summary['train_size']} repos={len(train_repos)}")
+    if args.single_issue:
+        # Smoke-test mode: bypass split, train on exactly one issue.
+        # Issue IDs are NOT unique across repos (see #data/index.jsonl
+        # — the same `issue-974` appears in agentscope-ai/agentscope
+        # and in strands-agents/sdk-python). We require --single-repo
+        # alongside --single-issue to disambiguate. Falling back to
+        # the first match is silently wrong.
+        if not args.single_repo:
+            sys.exit("--single-issue requires --single-repo "
+                     "(issue ids collide across repos)")
+        match = [r for r in index
+                 if r["id"] == args.single_issue and r["repo"] == args.single_repo]
+        if not match:
+            sys.exit(f"--single-issue {args.single_issue!r} / "
+                     f"--single-repo {args.single_repo!r} not in index")
+        target_repo = match[0]["repo"]
+        train_repos = [target_repo]
+        # Use the smallest achievable "actual train size" = number of
+        # issues in this repo, so the manifest is honest about coverage.
+        issues_in_repo = [r for r in index if r["repo"] == target_repo]
+        summary = {
+            "train_size": len(issues_in_repo),
+            "train_repos": train_repos,
+            "single_issue": args.single_issue,
+        }
+        print(f"[spl] single-issue={args.single_issue} repo={target_repo} "
+              f"effective_train_size={summary['train_size']}")
+    else:
+        _, _, summary = split_mod.split(
+            index, args.train_size, seed=args.seed, mode=args.mode,
+        )
+        train_repos = summary["train_repos"]
+        print(f"[spl] mode={args.mode} req={args.train_size} "
+              f"actual={summary['train_size']} repos={len(train_repos)}")
 
     if args.repos:
         train_repos = [r for r in train_repos if r in set(args.repos)]
@@ -322,6 +397,7 @@ def main() -> None:
         actual_train_size=summary["train_size"],
         repos=train_repos,
         issues_per_repo=issues_per_repo,
+        single_issue=getattr(args, "single_issue", None),
     )
     print(f"[done] skill at {skill_dir}")
 

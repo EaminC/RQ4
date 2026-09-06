@@ -34,13 +34,25 @@ workspace at `{scratch_dir}`. Inside that workspace you will find:
 - The full upstream source tree of `{repo}` — read it freely.
 - One folder per closed issue:
   `{scratch_dir}/issues/<issue_id>/`
-  containing:
-    - `issue.json`        — original GitHub issue body, labels,
-                            linked PRs.
-    - `patch.diff`        — the f2p-tested golden patch that fixed
-                            the issue.
-    - `f2p.txt`           — the fail-to-pass test trace.
-    - `summary.json`      — provenance and pass/fail status.
+  containing (some of which may be absent):
+    - `issue.json`         — original GitHub issue body, labels,
+                             linked PRs.
+    - `patch.diff`         — the f2p-tested golden patch that fixed
+                             the issue. **May be absent** — the
+                             dataset does not always carry it. If you
+                             see `PATCH_MISSING.txt` instead, distill
+                             the fix from the issue body + failing
+                             test + surrounding code.
+    - `fail2pass_test.py`  — the test that was failing before the
+                             patch and passing after. Read this to
+                             understand the contract the fix has to
+                             satisfy.
+    - `f2p.txt`            — the fail-to-pass test trace / stdout.
+    - `summary.json`       — provenance and pass/fail status.
+    - `run.log`            — full agent run log (if present).
+    - `env.dockerfile`     — the test environment (if present).
+    - `agentsmith_stat.json` — token / cost / time stats for the
+                             original run (if present).
 
 These issues span the **whole** repo (train + test split from the
 research perspective — that doesn't matter for you, you are
