@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 # setup.sh — bootstrap mini-swe-agent for RQ4 against the tu-zi API gateway.
 #
-# What this does, in order:
+# mini-swe-agent is treated as a READ-ONLY EXTERNAL MODULE:
+#   - cloned into ./upstream/ (gitignored, never committed)
+#   - installed editable via `uv pip install -e ./upstream`
+#   - we never edit files inside ./upstream/
+# All RQ4-side configuration lives in this directory (mini.yaml, secrets.env,
+# smoke_test.py), one level above upstream/.
+#
+# What this script does, in order:
 #   1. Sanity-check tooling (git, python3, uv).
 #   2. Load or create ./secrets.env (API key, base URL, default model).
-#   3. Clone https://github.com/SWE-agent/mini-swe-agent.git into ./upstream/.
+#   3. Clone https://github.com/SWE-agent/mini-swe-agent.git into ./upstream/
+#      (refuses to touch an existing checkout with a different remote).
 #   4. Create an isolated `uv` venv in ./.venv and pip install -e the agent.
 #   5. Drop a mini.yaml that points litellm at the tu-zi OpenAI-compatible
 #      endpoint, plus a tiny smoke-test script.
@@ -92,12 +100,31 @@ log "Using model:    $DEFAULT_MODEL"
 
 # ---------------------------------------------------------------------------
 # 3. Clone upstream
+#    We treat mini-swe-agent as a read-only external dependency:
+#      - it lives in ./upstream/ (gitignored, never committed)
+#      - we only ever edit files OUTSIDE ./upstream/
+#      - this block refuses to clone into a non-empty upstream/ that
+#        does not match the official remote, so we can't accidentally
+#        poison a working copy with local edits.
 # ---------------------------------------------------------------------------
-if [[ ! -d "$UPSTREAM_DIR/.git" ]]; then
-    log "Cloning $UPSTREAM_REPO → $UPSTREAM_DIR"
-    git clone --depth 1 "$UPSTREAM_REPO" "$UPSTREAM_DIR"
-else
+OFFICIAL_REMOTE="https://github.com/SWE-agent/mini-swe-agent.git"
+
+if [[ -d "$UPSTREAM_DIR/.git" ]]; then
+    existing_remote="$(git -C "$UPSTREAM_DIR" config --get remote.origin.url 2>/dev/null || echo "")"
+    if [[ "$existing_remote" != "$OFFICIAL_REMOTE" ]]; then
+        err "upstream/ already exists but its remote is '$existing_remote',"
+        err "expected '$OFFICIAL_REMOTE'. Refusing to clobber. Move it aside first."
+        exit 1
+    fi
     log "Upstream already cloned at $UPSTREAM_DIR (skipping)"
+else
+    if [[ -d "$UPSTREAM_DIR" ]] && [[ -n "$(ls -A "$UPSTREAM_DIR" 2>/dev/null)" ]]; then
+        err "$UPSTREAM_DIR exists and is non-empty but is not a git checkout."
+        err "Move it aside before re-running setup.sh."
+        exit 1
+    fi
+    log "Cloning $OFFICIAL_REMOTE → $UPSTREAM_DIR"
+    git clone --depth 1 "$OFFICIAL_REMOTE" "$UPSTREAM_DIR"
 fi
 
 # ---------------------------------------------------------------------------
