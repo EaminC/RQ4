@@ -65,10 +65,9 @@ D is the rare class — only 15 issues total.
 **Skewed, long-tailed.** The top-1 repo contributes nearly 40 %; the
 bottom-5 together contribute ~5 %.
 
-See:
-- `../results/split/figures/01_per_repo_counts.png`
-- `../results/split/figures/02_per_category_counts.png`
-- `../results/split/figures/08_repo_size_distribution.png`
+![Per-repo counts](../results/split/figures/01_per_repo_counts.png)
+![Per-category counts](../results/split/figures/02_per_category_counts.png)
+![Repo size distribution](../results/split/figures/08_repo_size_distribution.png)
 
 ---
 
@@ -129,11 +128,11 @@ Source: `results/split/sweep.md`, side-by-side table.
 | 160 | 167.7 | 100.0 % | 194.3 | **0.0 %** | 168.0 | 100.0 % |
 | 180 | 184.3 | 100.0 % | 172.3 | **0.0 %** | 188.0 | 100.0 % |
 
-See:
-- `../results/split/figures/04_train_size_vs_actual.png`
-- `../results/split/figures/05_leakage_vs_train_size.png`
-- `../results/split/figures/06_cats_coverage_vs_train_size.png`
-- `../results/split/figures/07_strategy_comparison.png`
+![Train size: requested vs actual](../results/split/figures/04_train_size_vs_actual.png)
+![Leakage](../results/split/figures/05_leakage_vs_train_size.png)
+![Category coverage](../results/split/figures/06_cats_coverage_vs_train_size.png)
+![Strategy comparison bars](../results/split/figures/07_strategy_comparison.png)
+![Category × repo heatmap](../results/split/figures/03_category_x_repo_heatmap.png)
 
 ---
 
