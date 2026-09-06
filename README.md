@@ -9,6 +9,7 @@ bootstrapped by its own setup script.
 |---|------|---------|-------|
 | 1 | mini-swe-agent | `git clone` + `pip install -e` | [`scripts/setup.sh`](scripts/setup.sh) |
 | 2 | openhands (CLI) | `curl -fsSL https://install.openhands.dev/install.sh \| sh` | [`scripts/setup-openhands.sh`](scripts/setup-openhands.sh) |
+| 3 | utils (data) | `pip install openai>=1.0` | [`scripts/setup-utils.sh`](scripts/setup-utils.sh) |
 
 All components route their LLM calls through a shared OpenAI-compatible
 gateway (`https://api.tu-zi.com`).

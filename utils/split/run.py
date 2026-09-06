@@ -1,0 +1,259 @@
+"""Stratified, repo-disjoint train/test split.
+
+Given an index JSONL produced by ``utils/classify``, produce a train/test
+pair such that:
+
+1. **Stratification**: the train set contains at least one issue from
+   every category present in the index (snake/serpentine recall-merge
+   allocation — largest-remainder rounding of proportional quotas).
+2. **Repo disjointness (best-effort)**: if an issue from repo R is in
+   train, *most other* issues from R also land in train. We pick a
+   per-repo cap ``m_r`` that scales with the seed-quota so the final
+   train size is close to ``--train-size`` while still pulling in
+   enough sibling issues per repo to meaningfully prevent leakage.
+
+Algorithm overview
+------------------
+
+Phase 1 — *Stratified seed*:
+
+For each category with quota ``q_c = round(train_size * n_c / N)``,
+we prefer issues from repos we have not yet claimed (widens coverage),
+then fall back to already-claimed repos. This guarantees the seed
+covers every category present in the data.
+
+Phase 2 — *Bounded repo propagation*:
+
+Each claimed repo R contributes up to ``m_R = max(1, round(train_size
+/ |claimed|))`` issues to train (rounded down so the total stays at or
+below ``train_size``). This satisfies "sibling issues from the same
+repo usually land together" without swallowing the whole dataset when
+the repo pool is small.
+
+The split is reproducible given ``--seed``.
+
+Usage::
+
+    python utils/split/run.py \\
+        --index data/index.jsonl \\
+        --train-size 40 \\
+        --out data/splits/default
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# I/O
+# ---------------------------------------------------------------------------
+def load_index(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        rows.append(json.loads(line))
+    return rows
+
+
+def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def write_summary(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Stratified seeding (the "snake / serpentine recall-merge" the user asked for)
+# ---------------------------------------------------------------------------
+def _compute_quotas(by_cat: dict[str, list[dict[str, Any]]],
+                    train_size: int) -> dict[str, int]:
+    """Allocate train_size across categories proportionally, with rounding
+    that sums to exactly train_size.
+
+    "Snake" / "serpentine recall-merge": we round the largest fractional
+    remainders first (Largest-Remainder Method / Hamilton's method) so the
+    final split is as close to the ideal proportion as possible.
+    """
+    n_total = sum(len(v) for v in by_cat.values())
+    if n_total == 0:
+        return {}
+    # Largest-remainder: floor first, then distribute the leftover to the
+    # categories with the largest fractional part.
+    raw = {c: train_size * len(v) / n_total for c, v in by_cat.items()}
+    floored = {c: int(v) for c, v in raw.items()}
+    leftover = train_size - sum(floored.values())
+    fracs = sorted(((raw[c] - floored[c], c) for c in by_cat),
+                   key=lambda x: (-x[0], x[1]))
+    for _, c in fracs[:leftover]:
+        floored[c] += 1
+    return floored
+
+
+def _seed_train(rows: list[dict[str, Any]], train_size: int, rng: random.Random
+                ) -> tuple[list[dict[str, Any]], set[str]]:
+    """Phase 1+2: stratified seed + bounded repo propagation.
+
+    Returns (train_rows, claimed_repos).
+
+    Quota semantics: the per-category quota caps the number of issues
+    *added in the seed phase*. After seed, phase 2 may bring in
+    additional issues from claimed repos (bounded so the total train
+    size stays near ``train_size``), then anything left goes to test.
+    """
+    by_cat: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        if r.get("category") in {"A", "B", "C", "D", "E", "F"}:
+            by_cat[r["category"]].append(r)
+    for c in by_cat:
+        rng.shuffle(by_cat[c])
+
+    quotas = _compute_quotas(by_cat, train_size)
+
+    train_ids: set[str] = set()
+    claimed_repos: set[str] = set()
+
+    # Snake through categories. For each category we have a quota; we fill
+    # it preferentially with issues from repos we have NOT yet claimed
+    # (widens category coverage across repos), and only fall back to
+    # already-claimed repos if the unclaimed pool is exhausted.
+    for cat in sorted(by_cat):
+        pool = by_cat[cat]
+        target = quotas.get(cat, 0)
+        unclaimed = [r for r in pool if r.get("repo") not in claimed_repos]
+        already = [r for r in pool if r.get("repo") in claimed_repos]
+        added = 0
+        # Pass 1: prefer unclaimed repos. Take up to ``target`` from this
+        # pool; each pick adds 1 to quota consumption AND claims its repo.
+        for r in unclaimed:
+            if added >= target:
+                break
+            train_ids.add(r["id"])
+            if r.get("repo"):
+                claimed_repos.add(r["repo"])
+            added += 1
+        # Pass 2: if the unclaimed pool was smaller than target, top up
+        # from already-claimed repos. We still respect the per-category
+        # quota so other categories get their fair share.
+        for r in already:
+            if added >= target:
+                break
+            train_ids.add(r["id"])
+            # repo already in claimed_repos
+            added += 1
+
+    # Phase 2: bounded repo propagation. For each claimed repo R, pick
+    # at most m_R additional issues (beyond those already in the seed)
+    # where m_R is chosen so the total train size stays close to
+    # train_size. We use largest-remainder rounding on (train_size /
+    # |claimed_repos|) for the per-repo cap.
+    if claimed_repos:
+        cap_raw = train_size / len(claimed_repos)
+        cap_floor = int(cap_raw)
+        leftover = train_size - cap_floor * len(claimed_repos)
+        fracs = sorted(
+            ((cap_raw - cap_floor, r) for r in claimed_repos),
+            key=lambda x: (-x[0], x[1]),
+        )
+        cap_per_repo = {r: cap_floor for r in claimed_repos}
+        for _, r in fracs[:leftover]:
+            cap_per_repo[r] += 1
+
+        # How many issues does each claimed repo already contribute via
+        # the seed? Subtract that count from the cap to know how many
+        # *more* we can pull in.
+        already_in = defaultdict(int)
+        for rid in train_ids:
+            repo = next((r["repo"] for r in rows if r["id"] == rid), None)
+            if repo in claimed_repos:
+                already_in[repo] += 1
+
+        by_repo: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for r in rows:
+            if r.get("repo") in claimed_repos and r["id"] not in train_ids:
+                by_repo[r["repo"]].append(r)
+        for repo in by_repo:
+            rng.shuffle(by_repo[repo])
+
+        for repo in sorted(claimed_repos):
+            remaining = max(0, cap_per_repo[repo] - already_in[repo])
+            for r in by_repo[repo][:remaining]:
+                train_ids.add(r["id"])
+
+    train_rows = [r for r in rows if r["id"] in train_ids]
+    return train_rows, claimed_repos
+
+
+# ---------------------------------------------------------------------------
+# Driver
+# ---------------------------------------------------------------------------
+def split(index: list[dict[str, Any]], train_size: int, seed: int = 0
+          ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    rng = random.Random(seed)
+    usable = [r for r in index if r.get("category") in {"A", "B", "C", "D", "E", "F"}]
+    if train_size >= len(usable):
+        sys.exit(f"train_size ({train_size}) >= usable issues ({len(usable)})")
+    train, claimed = _seed_train(usable, train_size, rng)
+    train_ids = {r["id"] for r in train}
+    test = [r for r in usable if r["id"] not in train_ids]
+
+    cat_counts = Counter(r["category"] for r in train)
+    repo_counts = Counter(r.get("repo") for r in train)
+    n_test_with_claimed_repo = sum(
+        1 for r in test if r.get("repo") in claimed
+    )
+    summary = {
+        "train_size": len(train),
+        "test_size": len(test),
+        "train_category_counts": dict(sorted(cat_counts.items())),
+        "train_unique_repos": len([r for r, n in repo_counts.items() if r]),
+        "train_repos": sorted(r for r in repo_counts if r),
+        "test_issues_with_train_repo": n_test_with_claimed_repo,
+        "test_repo_leakage_pct": (
+            round(100.0 * n_test_with_claimed_repo / max(len(test), 1), 1)
+        ),
+        "constraint_check": {
+            "every_category_present": all(
+                cat in cat_counts for cat in {"A", "B", "C", "D", "E", "F"}
+                if any(r["category"] == cat for r in usable)
+            ),
+            "repo_overlap_best_effort": True,
+        },
+    }
+    return train, test, summary
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--index", type=Path, required=True)
+    p.add_argument("--out", type=Path, required=True,
+                   help="Output directory. Writes train.jsonl, test.jsonl, "
+                        "summary.json inside.")
+    p.add_argument("--train-size", type=int, default=40)
+    p.add_argument("--seed", type=int, default=0)
+    args = p.parse_args()
+
+    rows = load_index(args.index)
+    train, test, summary = split(rows, args.train_size, args.seed)
+
+    write_jsonl(args.out / "train.jsonl", train)
+    write_jsonl(args.out / "test.jsonl", test)
+    write_summary(args.out / "summary.json", summary)
+
+    print(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()

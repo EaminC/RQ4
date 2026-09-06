@@ -20,4 +20,6 @@ agent/mini-swe-agent/
 .idea/
 .vscode/
 __pycache__/
-*.pyc
+*.pycutils/.env
+data/
+utils/.env
