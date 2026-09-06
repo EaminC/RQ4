@@ -235,24 +235,54 @@ def _seed_train_repo_disjoint(
         if r.get("repo"):
             by_repo[r["repo"]].append(r)
 
-    all_repos = sorted(by_repo)
-    if not all_repos:
+    # Sort repos by issue count ASCENDING so a smaller request always
+    # maps to the smallest k that hits the target. (Previously this
+    # was a lexicographic sort combined with an rng-shuffle, which made
+    # the chosen k depend on the seed in ways that broke monotonicity:
+    # req=40 could give a *larger* train set than req=80.)
+    all_repos_sorted = sorted(by_repo, key=lambda r: (len(by_repo[r]), r))
+    if not all_repos_sorted:
         return [], set()
 
-    # Determine the number of repos to claim so that whole-repo
-    # propagation lands closest to train_size.
-    candidates: list[tuple[int, int, int]] = []  # (n_repos, train_size, leakage_ok)
-    for n in range(1, len(all_repos) + 1):
-        size = sum(len(by_repo[r]) for r in all_repos[:n])
-        candidates.append((n, size, 0))
-    # Pick the smallest n such that train_size >= requested target.
-    feasible = [c for c in candidates if c[1] >= train_size]
-    chosen_n = feasible[0][0] if feasible else candidates[-1][0]
+    # For each possible k, the train set is the sum of issue counts in
+    # the k smallest repos. We pick the SMALLEST k such that this sum
+    # is at least train_size (so train is monotone non-decreasing in
+    # the request, as B promises). When the request is larger than the
+    # whole dataset, we fall back to k = all repos.
+    cumsum: list[int] = []
+    running = 0
+    for r in all_repos_sorted:
+        running += len(by_repo[r])
+        cumsum.append(running)
+    feasible_k = [k for k, s in enumerate(cumsum, start=1) if s >= train_size]
+    chosen_n = feasible_k[0] if feasible_k else len(all_repos_sorted)
 
-    # Snake through repos (rng-shuffled order); within each repo the
-    # seed is the first issue that contributes a fresh category quota.
-    rng.shuffle(all_repos)
-    claimed = all_repos[:chosen_n]
+    # The first chosen_n repos (the smallest ones) form the canonical
+    # train set. If there are ties at the boundary we rng-roll the
+    # subset, but the k-th partial sum — and therefore the train size
+    # — is unchanged. So the actual train size is now a deterministic
+    # function of train_size alone; only the *identity* of the repos
+    # moves with the seed.
+    chosen_set: set[str] = set(all_repos_sorted[:chosen_n])
+    last_size = len(by_repo[all_repos_sorted[chosen_n - 1]]) if chosen_n else 0
+    boundary: list[str] = [
+        r for r in all_repos_sorted[:chosen_n]
+        if len(by_repo[r]) == last_size
+    ]
+    if chosen_n < len(all_repos_sorted) and len(boundary) > 1:
+        # Swap one boundary repo for the next-larger one (same count)
+        # using rng to keep the result seed-dependent but the size
+        # unchanged. With ties absent this branch never runs.
+        next_r = next(
+            (r for r in all_repos_sorted[chosen_n:]
+             if len(by_repo[r]) == last_size),
+            None,
+        )
+        if next_r is not None:
+            drop = rng.choice(boundary)
+            chosen_set.discard(drop)
+            chosen_set.add(next_r)
+    claimed = sorted(chosen_set)
     claimed_set = set(claimed)
 
     # Per-category seed quota (used only to verify we covered all cats).

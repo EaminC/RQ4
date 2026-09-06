@@ -22,4 +22,8 @@ agent/mini-swe-agent/
 __pycache__/
 *.pycutils/.env
 data/
+
+# Local plaintext scratch — contains secrets / chat history, NEVER track.
+history.txt
+*.local.txt
 utils/.env

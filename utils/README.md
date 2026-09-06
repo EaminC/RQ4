@@ -1,6 +1,6 @@
-# utils — dataset acquisition & preparation
+# utils — dataset acquisition, preparation, skill training, evaluation
 
-Three sub-components, run in order:
+Five sub-components, run in order:
 
 1. `download/` — pull `EaminC/AgentBug-Smith` `all_combined_f2p` dataset
    to `data/raw/`. Uses `git sparse-checkout` (no auth needed) — only
@@ -10,41 +10,70 @@ Three sub-components, run in order:
    category from `docs/taxonomy.md` and write a flat index at
    `data/index.jsonl`.
 3. `split/` — read `data/index.jsonl` and carve out a stratified,
-   repo-disjoint train/test split (e.g., 40 / N-40). Default
-   outputs at `data/splits/<split-name>/{train,test}.jsonl`.
+   repo-disjoint train/test split. Default outputs at
+   `data/splits/<split-name>/{train,test}.jsonl`.
+4. `train/` — for each `(agent, train_size)` pair we want to evaluate,
+   train a per-repo **skill** (`agent/skills/<agent>/<train_size>/...`)
+   by letting the agent summarise each train repo's patterns. Skills
+   are the *intervention* — they get injected into the agent at solve
+   time to test whether per-repo guidance improves solve rate.
+5. `verify/` — build the **evaluation (verify) pool** and per-skill
+   **index files**. The pool is a *patch-stripped* copy of every
+   `data/raw` issue (so the agent can't cheat by reading the gold
+   diff). Each of the 6 skills we trained gets its own index that
+   assigns every issue to `split=0` (train, excluded) or `split=1`
+   (test, used by the solver). Solver script `solve.py` (next) drives
+   the agent on each test issue and records pass/fail.
 
-No agent harness — just scripts. Steps 2 and 3 do not depend on
-mini-swe-agent or openhands, only on the same LLM gateway the
-agent components use.
+No agent harness in `download/classify/split/verify/` — just scripts.
+Only `train/` invokes the agent (and only once per (repo, skill),
+the work that runs an LLM to summarise the repo).
 
 ## Why not an agent?
 
-The user explicitly asked for this. The classification task is
-mechanical (one call per issue, JSON out) and the split is a pure
-algorithm. Using an agent here would add tool-call noise, nondeterminism,
-and cost. The LLM call itself goes straight through the OpenAI SDK
-against the tu-zi gateway.
+The user explicitly asked for this. The classification, split, and
+verify-pool-build steps are mechanical (one LLM call per issue for
+classification; pure algorithms for split and verify pool). Using
+an agent here would add tool-call noise, nondeterminism, and cost.
+The classification LLM call itself goes straight through the
+OpenAI SDK against the tu-zi gateway.
+
+The **train** step *does* use an agent — there each repo is too
+complex for a deterministic script, and the per-repo summary is the
+whole point of the experiment.
 
 ## Files
 
 - `download/run.py`     — sparse-checkout the dataset
 - `classify/run.py`     — batch LLM classification → index.jsonl
 - `split/run.py`        — stratified, repo-disjoint train/test split
-- `pipeline.py`         — runs all three end-to-end
+- `train/train_skill.py` — per-repo skill writer (LLM)
+- `train/run_all.sh`    — train all 6 skills end-to-end
+- `verify/build_verify.py` — build patch-stripped pool + 6 per-skill indices
+- `pipeline.py`         — runs download → classify → split end-to-end
 - `config.json`         — shared tunables (LLM endpoint, paths, defaults)
-- `README.md`           — usage docs
+- `README.md`           — this file
 
 ## Pipeline
 
 ```bash
 source agent/.venv/bin/activate
 source utils/.env
+
+# Steps 1–3: dataset prep (no agent)
 python utils/pipeline.py                       # full dataset
 python utils/pipeline.py --limit 20            # 20-issue dry run
+
+# Step 4: train 6 skills (one LLM call per repo per skill)
+bash utils/train/run_all.sh                    # 2 agents × 3 sizes
+FORCE=1 bash utils/train/run_all.sh            # rebuild all skills
+
+# Step 5: build verify pool + 6 indices
+python utils/verify/build_verify.py            # idempotent
+python utils/verify/build_verify.py --audit    # leak-vector scan
 ```
 
-The pipeline runs three steps in order. Each can also be run
-individually:
+Each step can also be run individually:
 
 ```bash
 python utils/download/run.py --out data/raw
@@ -55,7 +84,51 @@ python utils/split/run.py \
     --index data/index.jsonl \
     --train-size 40 \
     --out data/splits/default
+python utils/train/train_skill.py \
+    --agent openhands --train-size 60 \
+    --mode repo_disjoint --seed 42
+python utils/verify/build_verify.py
 ```
+
+## Verify pool design
+
+The pool (`data/verify/_pool/<issue-id>/`) is a one-shot, *patch-stripped*
+copy of every raw issue directory. To prevent the agent from cheating
+by reading the gold solution:
+
+- `issue_<NNN>.json` → metadata only. The keys `linked_prs[].patch`,
+  `linked_prs[].base_sha`, and `linked_prs[].head_sha` are removed.
+  Public PR metadata (number, state, title, url, merged, base_branch)
+  is preserved.
+- `generated_patch.diff` → never copied.
+- `run.log` (the agent's stdout, contains the agent's attempted
+  patch diffs) → copied only if it has no `diff --git` header;
+  otherwise dropped. Empirically 185/200 run.logs are dropped.
+- `f2p.txt` / `dockerbuild.txt` → copied only if diff-free.
+- Everything else (`env.dockerfile`, `agentsmith_fail2pass_*.py`,
+  `summary.json`, `agentsmith_stat.json`) is copied verbatim.
+
+Per-skill index files (`data/verify/issue_index_<agent>_<train_size>.jsonl`)
+have one row per issue with:
+
+```json
+{
+  "split": 1,                              // 0=train(excluded), 1=test(solve)
+  "id": "issue-1077",
+  "repo": "strands-agents/harness-sdk",
+  "category": "B",
+  "verify_dir": "data/verify/_pool/issue-1077",
+  "test_relpath": "tests/agentsmith_fail2pass_1077.py",
+  "f2p_status": true,
+  "source_split": {"agent": "openhands", "train_size_requested": 40,
+                   "mode": "repo_disjoint", "seed": 42}
+}
+```
+
+The split assignment is `(repo, id)` composite-keyed to avoid a
+latent dedup bug in `utils/split/run.py` where 8 ids that collide
+across repos (`issue-563`, `issue-974`, …) used to silently vanish
+from the test set.
 
 ## Split algorithm notes
 
@@ -78,12 +151,3 @@ small datasets:
    `test_repo_leakage_pct` so you can see how much overlap remains.
 
 The split is deterministic given `--seed`.
-
-## Files
-
-- `download/run.py`     — sparse-checkout the dataset
-- `classify/run.py`     — batch LLM classification → index.jsonl
-- `split/run.py`        — stratified, repo-disjoint train/test split
-- `pipeline.py`         — runs all three end-to-end
-- `config.json`         — shared tunables (LLM endpoint, paths, defaults)
-- `README.md`           — this file

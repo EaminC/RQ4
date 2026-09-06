@@ -21,6 +21,7 @@ pdf:
 	  -V geometry:margin=1in \
 	  -V mainfont="Helvetica" \
 	  -V monofont="Menlo" \
+	  -V mathfont="STIX Two Math" \
 	  -V colorlinks=true \
 	  -o $(OUT)
 

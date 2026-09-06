@@ -1,5 +1,5 @@
 # Progress Report — RQ4
-*For advisor review. Last updated: 2026-09-06.*
+*For advisor review. Last updated: 2026-09-06 (verify pool).*
 
 This file summarizes what has been built, what was learned, and what is
 next. It references files in this repository and the figures under
@@ -15,11 +15,13 @@ next. It references files in this repository and the figures under
 | 2. Taxonomy | done (revised once) | `docs/taxonomy.md` (837 lines), `taxonomy` |
 | 2. Issue collection | done | `data/issues/*.md`, `data/index.jsonl` (200 issues) |
 | 2. Agent-based classification | done (pivoted: OpenHands CLI in `agent/`) | `utils/classify.py`, `utils/run_classify.sh` |
-| **3. Train/test split** | **done** | `utils/split/{run,dist_stats,visualize}.py`, `results/split/` |
-| 4. LLM evaluation / downstream | pending | — |
+| 3. Train/test split | done | `utils/split/{run,dist_stats,visualize}.py`, `results/split/` |
+| 4. Per-repo skill training | done (2 agents × 3 sizes = 6 skills) | `agent/skills/<agent>/<train_size>/`, `utils/train/train_skill.py` |
+| 5. Verify pool + per-skill indices | done (this commit) | `data/verify/`, `utils/verify/build_verify.py` |
+| 6. Agent solve loop on verify set | pending (next) | — |
 
-This session covered Component 3. Components 1–2 are summarized briefly
-in §6 for context.
+This session covered Component 5 (verify pool). Components 1–4 are
+summarised briefly in §6 for context.
 
 ---
 
@@ -94,13 +96,25 @@ claims the whole repo before any other instance of it.
 
 ### B. `repo_disjoint` — strict whole-repo isolation
 
-1. Pick the smallest number N of repos such that
+1. Sort repos ascending by issue count.
+2. Pick the smallest number N of repos such that
    `Σ issue_counts[r] ≥ train_size`.
-2. Claim **every** issue from those N repos; everything else → test.
+3. Claim **every** issue from those N repos; everything else → test.
 
 **Effect**: by construction `test_repo_leakage_pct == 0`. Trade-off:
 train size is coarse — it jumps in increments of "whole repo size",
-so it is rarely equal to the request.
+so it is rarely equal to the request. On this dataset it shows two
+plateaus: a step from `k=9→10` jumps 50 → 121 (one large repo
+enters the train set), and `k=10→11` jumps 121 → 200 (the whole
+corpus).
+
+> **Note (bug fix)**: an earlier version of step 2 used a
+> lexicographic sort plus `rng.shuffle`, which made the chosen k
+> depend on the seed in a way that broke monotonicity (e.g. `req=40`
+> gave a *larger* train set than `req=80` for some seeds). The
+> ascending-by-size sort makes step 2 a pure function of
+> `train_size`, so every seed now returns the same train/test sizes
+> and the actual train is monotone non-decreasing in the request.
 
 ### C. `greedy_issue` — issue-level greedy
 
@@ -112,21 +126,222 @@ so it is rarely equal to the request.
 once we exhaust the fresh-repo pool we must reuse claimed repos, so
 leakage goes back to ~100 %.
 
+### Theoretical analysis: a probability / combinatorics framing
+
+We formalise the split problem as follows.
+
+**Setup.** Let $R$ be the set of repos, with sizes
+$r_i = |\text{repo}_i|$ and $\sum_i r_i = N$. Let $C$ be the set of
+categories. Define the counts matrix $n_{rc}$ = number of issues of
+category $c$ in repo $r$. Let $k \in [1, N)$ be the requested training
+set size. Let $R_{\text{train}} \subseteq R$ be the set of repos that
+contribute at least one issue to the training set. Define the
+*repo leakage fraction* as
+
+$$
+L \;=\; \frac{\bigl|\{\, i \in \text{test} : \text{repo}(i) \in R_{\text{train}} \,\}\bigr|}{N_{\text{test}}}
+\qquad (L = 0 \text{ strict isolation},\; L = 1 \text{ full contamination}).
+$$
+
+---
+
+#### Strategy A — Bounded Per-Repo Cap
+
+A claims every repo (because the per-repo cap is $\ge 1$ for all repos
+when $k \le N$). Therefore $R_{\text{train}} = R$ always, and
+
+$$
+L_A^{\min} \;=\; L_A^{\max} \;=\; 1, \qquad L_A^{\text{actual}} \approx 1.0
+\quad (100\%\text{ in all sweeps},\; k = 20,\dots,180).
+$$
+
+The expected train size is exactly $k$; the variance across seeds
+arises only from the order in which categories and repos are visited.
+A is **deterministically non-leakage-free** — no amount of
+randomisation changes $L_A$.
+
+---
+
+#### Strategy B — Repo-Disjoint (Strict Whole-Repo Isolation)
+
+Sort repos by size ascending:
+$r_{(1)} \le r_{(2)} \le \cdots \le r_{(R)}$. Define the prefix sums
+
+$$
+S_k \;=\; \sum_{i=1}^{k} r_{(i)}, \qquad S_0 = 0.
+$$
+
+B claims exactly the smallest $k^*$ repos where
+
+$$
+k^* \;=\; \min\{\, k : S_k \ge k \,\}. \tag{1}
+$$
+
+The actual training set size is $S_{k^*}$ (the sum of those repos).
+Since repos are taken whole, $k \le S_{k^*} < k + r_{(k^*+1)}$, so
+the approximation error is bounded by the size of the *next* repo.
+
+**Best case** (most efficient packing). The repo sizes are tiny
+relative to $k$, so $k^* \approx k / \bar r$ and the excess
+$S_{k^*} - k$ is small. The leakage is strictly
+
+$$
+L_B \;=\; 0 \qquad \text{by construction.} \tag{2}
+$$
+
+**Worst case** (least efficient packing). A single dominant repo
+covers almost the whole corpus, e.g. $r_{(R)} \approx N$. Then any
+$k < r_{(R)}$ forces $k^* = R-1$ and $S_{k^*} = N - r_{(R)} \approx 0$,
+so the training set may be much smaller than $k$. The bound on
+under-fill is
+
+$$
+k - S_{k^*-1} \;<\; r_{(k^*)}. \tag{3}
+$$
+
+i.e. the worst-case gap is exactly the size of the first repo that
+*does* reach the threshold. For our dataset the 10th repo (79 issues)
+causes the $\texttt{req}=80 \rightarrow \texttt{train}=121$ plateau;
+the gap is $121 - 80 = 41$, which equals $r_{(11)} = 79$ capped by the
+last partial sum.
+
+**Theoretical summary for B:**
+
+| quantity | formula | dataset value |
+|---|---|---|
+| leakage | $0$ (always) | $0.0\%$ |
+| best-case train | $k$ | never achieved |
+| worst-case train | $S_{k^*}$ in (1) | see plateau table |
+| error bound | $< r_{(k^*+1)}$ | max gap = 79 |
+| monotonicity | $S_k$ monotone $\uparrow$ | confirmed |
+
+---
+
+#### Strategy C — Greedy Issue-Level
+
+C makes two passes over the $R \times C$ category–repo matrix.
+
+*Pass 1* (fresh repos): each of the $R \times C$ cells contributes at
+most one issue to train, drawn from an unclaimed repo. Let
+
+$$
+F \;=\; \sum_{r \in R_{\text{train}}} \sum_{c \in C} \min(1, n_{rc})
+\qquad \text{(issues from fresh cells)}.
+$$
+
+*Pass 2* (repo reuse): if $F < k$, C reuses already-claimed repos until
+the size reaches $k$. All reused issues introduce leakage.
+
+**Best case:** $k \le F$ — the request is satisfied entirely in Pass 1,
+no repo is reused, and $L_C = 0$. This requires
+$k \le R \times C = 11 \times 6 = 66$ in general, or $k \le 66$ on our
+dataset (confirmed by sweep: $k=20,40,60$ all show leakage $< 100\%$,
+with $k=60$ at the boundary).
+
+**Worst case:** $k > F$ — Pass 1 is exhausted and Pass 2 must reuse
+every claimed repo. Every test issue shares a repo with train, so
+
+$$
+L_C^{\max} \;=\; 1 \qquad \text{(full contamination).} \tag{4}
+$$
+
+**Theorem (strategic trade-off).** For any dataset with $R$ repos,
+$C$ categories, and $N$ total issues:
+
+| strategy | leakage | train size | other property |
+|---|---|---|---|
+| A  | $L_A \in \{1\}$ | exact hit on $k$ | no isolation guarantee |
+| B  | $L_B = 0$ | bounded error $\;< r_{(k^*+1)}$ | monotone, but coarse |
+| C  | $L_C \in [0, 1]$ | exact hit on $k$ | isolation until $k > F$ |
+
+No strategy can simultaneously achieve $L = 0$ and $\texttt{train} = k$
+unless $|R|$ is large enough (in our case $R = 11$) or the request $k$
+is small enough that the smallest repos suffice. This fundamental
+tension is the reason we recommend **B** for RQ4's final reported
+experiment: it provides a *guarantee*, not just an empirical
+observation.
+
+---
+
+#### Concrete numbers on this dataset
+
+$N = 200,\; R = 11,\; C = 6$. Sorted repo sizes
+
+$$
+r_{(1..11)} = [1,\; 2,\; 2,\; 3,\; 5,\; 8,\; 11,\; 15,\; 24,\; 50,\; 79],
+$$
+
+with prefix sums
+
+$$
+S_k = [1,\; 3,\; 5,\; 8,\; 13,\; 21,\; 32,\; 47,\; 71,\; 121,\; 200].
+$$
+
+**Strategy A** (per-repo cap $m_R = \lfloor k / |\text{claimed}| \rfloor \approx k/11$):
+
+| $k$ | per-repo cap | actual train | leakage |
+|--:|---:|---:|---:|
+| 20  | $\lfloor 20/11 \rfloor = 1$  | 28.7  | 99.2 %  |
+| 60  | $\lfloor 60/11 \rfloor = 5$  | 76.7  | 100 %  |
+| 100 | $\lfloor 100/11 \rfloor = 9$ | 120.3 | 100 %  |
+| 180 | $\lfloor 180/11 \rfloor = 16$ | 184.3 | 100 %  |
+
+In every row $|R_{\text{train}}| = 11 = R$, confirming $L_A = 1$ from
+the preceding theorem. Excess over request is the price of rounding
+the per-repo cap up so each small repo contributes at least one issue.
+
+**Strategy B** (closed form using prefix sums above):
+
+| $k$ | $k^* = \arg\min S_k \ge k$ | actual train $= S_{k^*}$ | error $S_{k^*} - k$ |
+|--:|--:|--:|--:|
+| 20  | 6  | 21  | $+1$ |
+| 40  | 8  | 47  | $+7$ |
+| 60  | 9  | 71  | $+11$ |
+| 80  | 10 | 121 | $\mathbf{+41}$ (plateau) |
+| 100 | 10 | 121 | $+21$ |
+| 120 | 10 | 121 | $+1$ |
+| 140 | 11 | 200 | $+60$ |
+| 160 | 11 | 200 | $+40$ |
+| 180 | 11 | 200 | $+20$ |
+
+The $+41$ plateau at $\texttt{req}=80$ is exactly the jump from
+$S_9 = 71$ to $S_{10} = 121$ (adding the 50-issue repo) — i.e.
+inequality (3) holds with the largest gap $41 < r_{(11)} = 79$. For
+$\texttt{req} \ge 140$, $k^*$ saturates at $R = 11$ and train collapses
+to the whole corpus, leaving test empty.
+
+**Strategy C** (fresh-cell bound $F \le R \times C = 66$):
+
+| $k$ | $F$ achievable? | leakage |
+|--:|---|---:|
+| 20  | yes (well below 66) | 98.7 % |
+| 60  | yes (boundary)       | 100 %  |
+| 80  | no  (Pass 2 forced)  | 100 %  |
+| 180 | no                   | 100 %  |
+
+The 98.7 % at $k = 20$ (not 100 %) is the only case where Pass 1 still
+dominates: the snake through the 66 (repo, category) cells picks 21
+distinct cells, and Pass 2 reuses at most 1 issue — most test issues
+are from repos that were never claimed, hence $L < 1$. From $k \ge 60$
+onwards Pass 1 is exhausted and $L_C = 1$.
+
+---
+
 ### Numerical comparison (averaged over 3 seeds)
 
 Source: `results/split/sweep.md`, side-by-side table.
 
 | requested | A train | A leakage | B train | B leakage | C train | C leakage |
 |---:|---:|---:|---:|---:|---:|---:|
-| 20 | 28.7 | 99.2 % | 43.0 | **0.0 %** | 20.3 | 98.7 % |
-| 40 | 53.3 | 100.0 % | 92.3 | **0.0 %** | 43.0 | 100.0 % |
-| 60 | 76.7 | 100.0 % | 79.0 | **0.0 %** | 62.7 | 100.0 % |
-| 80 | 97.7 | 100.0 % | 62.3 | **0.0 %** | 83.7 | 100.0 % |
-| 100 | 120.3 | 100.0 % | 154.3 | **0.0 %** | 106.0 | 100.0 % |
-| 120 | 138.3 | 100.0 % | 190.3 | **0.0 %** | 128.0 | 100.0 % |
-| 140 | 153.0 | 100.0 % | 190.3 | **0.0 %** | 147.7 | 100.0 % |
-| 160 | 167.7 | 100.0 % | 194.3 | **0.0 %** | 168.0 | 100.0 % |
-| 180 | 184.3 | 100.0 % | 172.3 | **0.0 %** | 188.0 | 100.0 % |
+| 20 | 28.7 | 99.2 % | 21.0 | **0.0 %** | 20.3 | 98.7 % |
+| 40 | 53.3 | 100.0 % | 47.0 | **0.0 %** | 43.0 | 100.0 % |
+| 60 | 76.7 | 100.0 % | 71.0 | **0.0 %** | 62.7 | 100.0 % |
+| 80 | 97.7 | 100.0 % | 121.0 | **0.0 %** | 83.7 | 100.0 % |
+| 100 | 120.3 | 100.0 % | 121.0 | **0.0 %** | 106.0 | 100.0 % |
+| 120 | 138.3 | 100.0 % | 121.0 | **0.0 %** | 128.0 | 100.0 % |
+| 140 | 153.0 | 100.0 % | 200.0 | **0.0 %** | 147.7 | 100.0 % |
+| 160 | 167.7 | 100.0 % | 200.0 | **0.0 %** | 168.0 | 100.0 % |
+| 180 | 184.3 | 100.0 % | 200.0 | **0.0 %** | 188.0 | 100.0 % |
 
 ![Train size: requested vs actual](../results/split/figures/04_train_size_vs_actual.png)
 ![Leakage](../results/split/figures/05_leakage_vs_train_size.png)
@@ -188,21 +403,114 @@ agent (`utils/classify.py`, `utils/run_classify.sh`), not a hosted
 LLM. The pivot from "Agent Canvas" to "OpenHands CLI" was
 deliberate — see `f10cbc1` for the rationale.
 
+### 6.3 Component 4 — per-repo skill training
+
+`utils/train/train_skill.py` (`bash utils/train/run_all.sh` runs all 6
+skills end-to-end). For each `(agent, train_size)` pair, we let the
+agent look at *every* train issue from a claimed repo and write a
+per-repo summary `agent/skills/<agent>/<train_size>/repos/<owner>__<name>.md`.
+All repo-level summaries are then concatenated with a template
+(`prompts.SKILL_TEMPLATE`) into the agent's system prompt via the
+`SKILL.md` file in the same directory. The same template is also used
+to write a generic `fallback_generic_fix.md` for repos the agent
+*did not* see at train time (e.g. test repos).
+
+Six skills were trained:
+
+```
+agent/skills/
+├── mini-swe-agent/{40,60,80}/
+└── openhands/      {40,60,80}/
+```
+
+Each skill ships with a `manifest.json` recording provenance (which
+issues were used as train, which LLM was called, what cost was
+incurred). A `single_issue` / `single_repo` smoke-test mode lets us
+verify the pipeline end-to-end on one issue before paying for the
+full sweep.
+
+### 6.4 Component 5 — verify pool (this commit)
+
+`utils/verify/build_verify.py` writes two artefacts:
+
+1. **`data/verify/_pool/<issue-id>/`** — a *patch-stripped* copy of
+   every raw issue directory (`data/raw/results/all_combined_f2p/...`).
+   192 unique dirs, 63 MB total, 185/200 `run.log` files dropped
+   because they contain the agent's attempted patch diffs (a leak
+   vector). For each issue:
+   - `issue_<NNN>.json` is rewritten with the gold patch removed:
+     `linked_prs[].patch`, `linked_prs[].base_sha`,
+     `linked_prs[].head_sha` are stripped. Public PR metadata
+     (number, state, title, url, merged, base_branch) is
+     preserved.
+   - `generated_patch.diff` is never copied (115 raw dirs had it).
+   - `run.log` / `f2p.txt` / `dockerbuild.txt` are copied only if
+     diff-free (their default heuristic is `diff --git ` literal or
+     a `@@` hunk header anywhere in the file).
+   - `env.dockerfile`, `agentsmith_fail2pass_*.py`, `summary.json`,
+     `agentsmith_stat.json` are copied verbatim.
+2. **Six per-skill indices**,
+   `data/verify/issue_index_<agent>_<train_size>.jsonl`, one row per
+   issue (200 rows each), `split ∈ {0, 1}`:
+   - `0` = train issue, the agent must NOT be shown this when
+     solving (skill contamination);
+   - `1` = test issue, the agent is shown this and asked to produce
+     a patch.
+
+   All 6 indices share the same `seed=42, mode=repo_disjoint` so the
+   issue-level train/test partition is identical across skills; only
+   the *size* of train (and hence test) varies. The split assignment
+   is keyed by `(repo, id)` to avoid a latent dedup bug in
+   `utils/split/run.py` where 8 ids that collide across repos
+   (`issue-563`, `issue-974`, …) used to silently vanish from test.
+
+| skill | train | test | repo leak |
+|---|---:|---:|---:|
+| mini-swe-agent_40 / openhands_40 | 47 | 153 | 0 % |
+| mini-swe-agent_60 / openhands_60 | 71 | 129 | 0 % |
+| mini-swe-agent_80 / openhands_80 | 121 | 79 | 0 % |
+
+Monotonicity check: any issue in train at `train_size=40` is also in
+train at `train_size=60` and `80` (0 violations across the 200
+issues). Same-size / cross-agent agreement: 0 mismatches.
+
+A `verify_manifest.json` records the per-split counts and a leak
+audit (`audit.json`) reports `192/192 issues clean`. Run again any
+time with `python utils/verify/build_verify.py --audit` (idempotent;
+`--force-pool` rebuilds the pool from scratch).
+
+The next step (§7) is to drive the agent on every `split=1` issue in
+each of the 6 indices, with and without the corresponding
+`SKILL.md` injected, and record pass/fail.
+
 ---
 
 ## 7. What is next
 
-1. **Pick the official split** — finalize B at some reasonable
-   `train_size`, e.g. `train_size=60` giving 79 train / 121 test with
-   the 4 smallest repos (sdk-python, open-interpreter, AutoGPT,
-   dapr-agents) at risk of dropping from test.
-2. **Run downstream**: LLM-as-judge on test issues in batches, or
-   embedding-similarity to a reference set.
-3. **Add box plots** to `utils/split/visualize.py` for train-size
+1. **Drive the solve loop on every test issue in every skill index**
+   (Component 6). For each of the 6 per-skill indices, iterate
+   `split=1` rows, point the agent at `data/verify/_pool/<id>/`,
+   inject the matching `agent/skills/<agent>/<train_size>/SKILL.md`
+   into the system prompt, and record pass/fail against the
+   `agentsmith_fail2pass_<NNN>.py` test. Also run a *no-skill*
+   baseline (same issue, same agent, SKILL.md removed) so the
+   per-skill lift can be reported. Expected cost: ~6 × 153 issues
+   per skill (lowest-size split) → ~918 runs with skill + 918
+   without = ~1.8k runs.
+2. **Reduce to the LLM metrics the paper needs**: pass rate
+   per-skill, per-category (A–F), per-repo, lift from skill vs
+   baseline, and statistical confidence (95 % CI via Wilson
+   interval). Render all of this into a 1-page summary figure
+   alongside the existing `results/split/figures/`.
+3. **Open question: how to score partial credit?** Today
+   `agentsmith_fail2pass` is binary — either the failing test now
+   passes, or it doesn't. For agent patches that "look right" but
+   don't flip the test, we currently mark zero. Worth considering a
+   second signal (e.g. embedding-similarity to the gold patch) so
+   we don't throw away useful signal.
+4. **Add box plots** to `utils/split/visualize.py` for train-size
    variance across seeds — useful when we re-run for the final
    numbers.
-4. **Consider**: cap test issues per repo at K to get leakage in
-   (0, 100 %) — a parameterised middle ground.
 
 ---
 
@@ -229,7 +537,22 @@ python utils/split/run.py \
   --train-size 60 \
   --mode repo_disjoint \
   --out results/split/final
+
+# 5. Train 6 skills (one LLM call per repo per skill)
+bash utils/train/run_all.sh
+
+# 6. Build the verify pool + 6 per-skill indices
+python utils/verify/build_verify.py            # idempotent
+python utils/verify/build_verify.py --audit    # + leak-vector scan
+
+# 7. (next) Run the solve loop on every test issue in every skill
+python utils/verify/solve.py \
+    --agent openhands --train-size 40 \
+    --index data/verify/issue_index_openhands_40.jsonl \
+    --split test \
+    --out results/verify/openhands_40.jsonl
 ```
 
 This produces `train.jsonl`, `test.jsonl`, `summary.json` under
-`results/split/final/`.
+`results/split/final/`, the full `agent/skills/` tree, and
+`data/verify/{_pool,issue_index_*.jsonl,verify_manifest.json,audit.json}`.

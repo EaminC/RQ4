@@ -16,12 +16,12 @@ cd "$REPO_ROOT"
 # (agent, train_size) pairs. Per the prompt.md design notes, these three
 # sizes hit the three coarse buckets of repo_disjoint.
 PAIRS=(
-  "mini-swe-agent 20"
   "mini-swe-agent 40"
-  "mini-swe-agent 100"
-  "openhands 20"
+  "mini-swe-agent 60"
+  "mini-swe-agent 80"
   "openhands 40"
-  "openhands 100"
+  "openhands 60"
+  "openhands 80"
 )
 
 if [[ "${FORCE:-0}" == "1" ]]; then

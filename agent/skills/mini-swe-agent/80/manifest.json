@@ -1,0 +1,19 @@
+{
+  "agent": "mini-swe-agent",
+  "train_size_requested": 80,
+  "train_size_actual": 121,
+  "split_mode": "repo_disjoint",
+  "seed": 42,
+  "repos_trained": [
+    "Significant-Gravitas/AutoGPT",
+    "crewAIInc/crewAI",
+    "openinterpreter/open-interpreter"
+  ],
+  "issues_per_repo": {
+    "Significant-Gravitas/AutoGPT": 2,
+    "crewAIInc/crewAI": 24,
+    "openinterpreter/open-interpreter": 2
+  },
+  "total_issues_for_skill": 28,
+  "skill_dir": "agent/skills/mini-swe-agent/80"
+}
