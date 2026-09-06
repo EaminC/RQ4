@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# run_openhands.sh — start OpenHands Agent Canvas with our env loaded.
-# Usage: bash agent/run_openhands.sh [agent-canvas options...]
+# run_openhands.sh — invoke the OpenHands CLI headless with our env loaded.
+# Usage: bash agent/run_openhands.sh -t "your task"   (or pass any openhands flags)
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 set -a
 source "/Users/eamin/Desktop/RQ4/agent/openhands-config/.env"
 set +a
-exec agent-canvas "$@"
+exec openhands --headless --override-with-envs --yolo "$@"

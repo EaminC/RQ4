@@ -46,57 +46,48 @@ source agent/.venv/bin/activate
 python agent/config/smoke_test.py
 ```
 
-## Component 2 — `openhands` (Agent Canvas)
+## Component 2 — `openhands` CLI
 
-Wraps [`OpenHands/OpenHands`](https://github.com/OpenHands/OpenHands) via
-the [`@openhands/agent-canvas`](https://www.npmjs.com/package/@openhands/agent-canvas)
-npm package. Unlike component 1, this is a long-running web UI rather
-than a one-shot CLI.
+Wraps [`OpenHands/OpenHands-CLI`](https://github.com/OpenHands/OpenHands-CLI),
+the official lightweight CLI binary. Headless mode gives us the same
+one-shot shape as component 1: the CLI takes a task, makes the changes,
+exits.
 
 ### Boundary
 
 | Layer | Owner | Tracked? |
 | --- | --- | --- |
-| `@openhands/agent-canvas` (global npm install) | npm registry | **No** (system-level) |
+| `openhands` binary (`~/.local/bin/openhands`) | OpenHands installer | **No** (system-level) |
 | `openhands-config/`, `run_openhands.sh` | **RQ4** | Yes |
 
 ### LLM configuration
 
-OpenHands stores LLM settings in an encrypted server-side store. They
-cannot be pre-configured from the CLI. On first launch:
+We use `--override-with-envs` to pass `LLM_API_KEY` / `LLM_BASE_URL` /
+`LLM_MODEL` from `openhands-config/.env` directly to the CLI on every
+run. No browser-based setup needed.
 
-1. Open <http://localhost:8000> in a browser.
-2. Go to **Settings → LLM** → toggle **Advanced**.
-3. Fill in:
-   - **Custom Model**: `openai/gpt-4o-mini`
-   - **Base URL**: `https://api.tu-zi.com/v1`
-   - **API Key**: the tu-zi key from `openhands-config/.env`
-4. **Save Changes**.
-
-See `openhands-config/README.md` for the canonical version.
+See `openhands-config/README.md` for the canonical explanation.
 
 ### Files
 
-- `run_openhands.sh` — sources `openhands-config/.env` (which exports
-  `LOCAL_BACKEND_API_KEY` and `OH_SECRET_KEY`), then `exec agent-canvas`.
-- `openhands-config/.env` — auto-generated API key + secret key
-  (gitignored, `chmod 600`).
+- `run_openhands.sh` — sources `openhands-config/.env` and `exec`s
+  `openhands --headless --override-with-envs --yolo "$@"`.
+- `openhands-config/.env` — `LLM_API_KEY` / `LLM_BASE_URL` /
+  `LLM_MODEL`. Gitignored, `chmod 600`.
 - `openhands-config/.env.example` — template.
-- `openhands-config/README.md` — LLM setup steps.
-- `openhands-config/smoke_test.sh` — boots the stack, hits `/alive`,
-  tears it down. Does NOT exercise the LLM (that needs the UI config
-  step above).
+- `openhands-config/README.md` — component explanation.
+- `openhands-config/smoke_test.sh` — issues a real headless task and
+  verifies the created artifact. Catches breakage in CLI ↔ gateway ↔
+  sandbox wiring end-to-end.
 
 ### Usage
 
 ```bash
-# one-time bootstrap (installs npm package, generates keys, smoke tests)
+# one-time install (not managed by this repo)
+curl -fsSL https://install.openhands.dev/install.sh | sh
+
+# bootstrap (writes .env, runs smoke test)
 bash scripts/setup-openhands.sh
 
-# start the canvas (foreground)
-bash agent/run_openhands.sh
-
-# or pick a port / mode
-bash agent/run_openhands.sh -p 9000
-bash agent/run_openhands.sh --backend-only
-```
+# run a task
+bash agent/run_openhands.sh -t "fix the failing test in src/foo.py"

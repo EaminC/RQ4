@@ -1,52 +1,49 @@
 #!/usr/bin/env bash
-# Smoke test: boot OpenHands Agent Canvas, wait for the ingress /alive
-# endpoint to return 200, then tear it down.
-#
-# We deliberately do NOT exercise the LLM here — that requires the user
-# to first save LLM settings via the web UI (see ../README.md).
+# Smoke test for the OpenHands CLI: issues a tiny task and verifies that
+# the agent actually produced the requested artifact. This exercises:
+#   - wrapper / .env loading
+#   - --override-with-envs flowing LLM_API_KEY / LLM_BASE_URL / LLM_MODEL
+#     into the CLI
+#   - the tu-zi gateway responding
+#   - the agent's tool-execution sandbox (writing files to a tmp dir)
 set -euo pipefail
 
-INGRESS_PORT="${INGRESS_PORT:-8000}"
-LOG_FILE="${LOG_FILE:-/tmp/openhands-smoke.log}"
-PID_FILE="${PID_FILE:-/tmp/openhands-smoke.pid}"
-
-echo "[smoke] starting agent-canvas (logs: $LOG_FILE)"
-agent-canvas >"$LOG_FILE" 2>&1 &
-PID=$!
-echo "$PID" >"$PID_FILE"
+WORK_DIR="$(mktemp -d /tmp/rq4-oh-smoke.XXXXXX)"
+EXPECTED_FILE="$WORK_DIR/smoke.txt"
+EXPECTED_CONTENT="rq4-component2-smoke"
+LOG_FILE="$WORK_DIR/trajectory.log"
 
 cleanup() {
-    if kill -0 "$PID" 2>/dev/null; then
-        echo "[smoke] killing agent-canvas (pid $PID)"
-        kill "$PID" 2>/dev/null || true
-        # give it a few seconds, then SIGKILL
-        for _ in 1 2 3 4 5; do
-            kill -0 "$PID" 2>/dev/null || break
-            sleep 1
-        done
-        if kill -0 "$PID" 2>/dev/null; then
-            kill -9 "$PID" 2>/dev/null || true
-        fi
-    fi
-    rm -f "$PID_FILE"
+    rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
 
-echo "[smoke] waiting for http://localhost:$INGRESS_PORT/alive (max 90s)"
-for i in $(seq 1 45); do
-    if curl -fsS -o /dev/null --max-time 2 "http://localhost:$INGRESS_PORT/alive"; then
-        echo "[smoke] OK: /alive returned 200 (after ${i}*2s)"
-        echo "SMOKE_OK"
-        exit 0
-    fi
-    if ! kill -0 "$PID" 2>/dev/null; then
-        echo "[smoke] FAIL: agent-canvas exited unexpectedly. Tail of log:" >&2
-        tail -n 50 "$LOG_FILE" >&2 || true
-        exit 1
-    fi
-    sleep 2
-done
+echo "[smoke] work dir:    $WORK_DIR"
+echo "[smoke] expected:     $EXPECTED_FILE"
+echo "[smoke] trajectory:   $LOG_FILE"
 
-echo "[smoke] FAIL: /alive did not return 200 within 90s. Tail of log:" >&2
-tail -n 80 "$LOG_FILE" >&2 || true
-exit 1
+cd "$WORK_DIR"
+# Issue a simple task the agent can complete in one turn.
+# Headless mode already auto-approves, but --yolo is defensive.
+openhands --headless --override-with-envs --yolo \
+    --exit-without-confirmation \
+    --json \
+    -t "Create a file at $EXPECTED_FILE containing exactly the text '$EXPECTED_CONTENT' (no other characters, no trailing newline). Just write the file and stop — do not run any other commands." \
+    >"$LOG_FILE" 2>&1
+
+if [[ ! -f "$EXPECTED_FILE" ]]; then
+    echo "[smoke] FAIL: $EXPECTED_FILE was not created." >&2
+    echo "[smoke] trajectory (tail):" >&2
+    tail -n 60 "$LOG_FILE" >&2 || true
+    exit 1
+fi
+
+ACTUAL_CONTENT="$(cat "$EXPECTED_FILE")"
+if [[ "$ACTUAL_CONTENT" != "$EXPECTED_CONTENT" ]]; then
+    echo "[smoke] FAIL: expected '$EXPECTED_CONTENT', got '$ACTUAL_CONTENT'" >&2
+    tail -n 60 "$LOG_FILE" >&2 || true
+    exit 1
+fi
+
+echo "[smoke] OK: $EXPECTED_FILE contains the requested text"
+echo "SMOKE_OK"

@@ -1,31 +1,28 @@
 #!/usr/bin/env bash
 # ============================================================================
-# setup-openhands.sh — bootstrap the second RQ4 component: OpenHands
-# Agent Canvas, routed through the tu-zi OpenAI-compatible API gateway.
+# setup-openhands.sh — bootstrap the second RQ4 component: OpenHands CLI.
 #
 # Run from the RQ4 repo root:
 #     bash scripts/setup-openhands.sh
 #
 # What this does, in order:
-#   1. Sanity-check tooling (node ≥ 22.12, npm).
-#   2. Install @openhands/agent-canvas globally via npm (skip if already at
-#      the pinned version).
-#   3. Write ./agent/openhands-config/.env with tu-zi gateway credentials
-#      and an auto-generated API key / secret key for the OpenHands
-#      server. These are used by run_openhands.sh and protect the local
-#      Canvas UI.
-#   4. Drop a tiny smoke test that boots the canvas stack, waits for the
-#      ingress /alive endpoint to return 200, then tears it down.
-#   5. Run the smoke test.
+#   1. Verify `openhands` is on PATH (installed via OpenHands' official
+#      binary installer script — we do not manage it ourselves).
+#   2. Write ./agent/openhands-config/.env with the tu-zi gateway
+#      credentials (LLM_API_KEY / LLM_BASE_URL / LLM_MODEL). These are
+#      picked up by the wrapper via --override-with-envs.
+#   3. Drop a wrapper script (agent/run_openhands.sh) and a config README.
+#   4. Run a smoke test that issues a tiny headless task and verifies the
+#      artifact file was actually created (proves end-to-end wiring of
+#      the CLI ↔ tu-zi gateway ↔ sandbox).
 #
-# Note: OpenHands stores LLM settings in an encrypted server-side store
-# (keyed by OH_SECRET_KEY). They CANNOT be pre-configured from the CLI.
-# After this script finishes, the user must open http://localhost:8000
-# once and pick the tu-zi gateway in Settings > LLM. See
-# agent/openhands-config/README.md for the exact steps.
+# Idempotent: re-running reuses the existing .env in place.
 #
-# Idempotent: re-running will reuse the existing global install and
-# regenerate config in place.
+# Install (one-time, separate from this script):
+#     curl -fsSL https://install.openhands.dev/install.sh | sh
+#
+# Analogous to scripts/setup.sh (component 1), but the install lives
+# outside this repo because the binary ships self-contained.
 # ============================================================================
 
 set -euo pipefail
@@ -44,9 +41,6 @@ README_FILE="$CONFIG_DIR/README.md"
 RUNNER="$REPO_ROOT/agent/run_openhands.sh"
 SMOKE="$CONFIG_DIR/smoke_test.sh"
 
-OH_PACKAGE="@openhands/agent-canvas"
-OH_PIN_VERSION="${OH_PIN_VERSION:-1.16.0}"
-
 # ---------------------------------------------------------------------------
 # tu-zi gateway configuration (shared with component 1)
 # ---------------------------------------------------------------------------
@@ -63,221 +57,175 @@ err()  { printf '\033[1;31m[setup-oh][error]\033[0m %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
 
 # ---------------------------------------------------------------------------
-# 1. Tooling checks
+# 1. Verify openhands CLI is on PATH
 # ---------------------------------------------------------------------------
 need_cmd() {
     command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1 — install it and re-run."
 }
 
-need_cmd node
-need_cmd npm
-
-NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-NODE_MINOR="$(node -p 'process.versions.node.split(".")[1]')"
-if (( NODE_MAJOR < 22 || (NODE_MAJOR == 22 && NODE_MINOR < 12) )); then
-    die "Node ≥ 22.12 required (found $NODE_MAJOR.$NODE_MINOR). Install via nvm or Homebrew."
+if ! need_cmd openhands; then
+    die "Install OpenHands CLI with: curl -fsSL https://install.openhands.dev/install.sh | sh"
 fi
 
-log "Tooling OK (node $NODE_MAJOR.$NODE_MINOR, npm $(npm --version))"
+OH_VERSION="$(openhands --version 2>/dev/null | grep -E '^OpenHands' | head -1 || openhands --version 2>&1 | head -1)"
+log "Found openhands: $(command -v openhands) ($OH_VERSION)"
 
 # ---------------------------------------------------------------------------
-# 2. Install @openhands/agent-canvas (pinned version, skip if up to date)
-# ---------------------------------------------------------------------------
-INSTALLED_VERSION="$(npm ls -g --depth=0 "$OH_PACKAGE" 2>/dev/null \
-    | awk -v pkg="$OH_PACKAGE" '$2==pkg {print $3}' \
-    | tr -d '`' | sed 's/@$//' || true)"
-
-if [[ "$INSTALLED_VERSION" == "$OH_PIN_VERSION" ]]; then
-    log "$OH_PACKAGE@$OH_PIN_VERSION already installed (skipping)"
-else
-    log "Installing $OH_PACKAGE@$OH_PIN_VERSION globally"
-    if [[ -n "$INSTALLED_VERSION" ]]; then
-        warn "Replacing previously installed version: $INSTALLED_VERSION"
-    fi
-    npm install -g "${OH_PACKAGE}@${OH_PIN_VERSION}" >/dev/null
-fi
-
-# ---------------------------------------------------------------------------
-# 3. Write .env — tu-zi credentials + auto-generated API / secret keys
+# 2. Write .env — tu-zi credentials for --override-with-envs
 # ---------------------------------------------------------------------------
 mkdir -p "$CONFIG_DIR"
 
-# Generate keys if .env is missing; otherwise reuse what's there so the
-# server doesn't reject previously issued auth tokens.
-if [[ ! -f "$ENV_FILE" ]]; then
-    API_KEY="$(openssl rand -hex 24 2>/dev/null || python3 -c 'import secrets; print(secrets.token_hex(24))')"
-    SECRET_KEY="$(openssl rand -hex 32 2>/dev/null || python3 -c 'import secrets; print(secrets.token_hex(32))')"
-    GENERATED_KEYS=1
-    log "Generated fresh API_KEY and OH_SECRET_KEY"
-else
-    API_KEY=""
-    SECRET_KEY=""
-    GENERATED_KEYS=0
+if [[ -f "$ENV_FILE" ]]; then
     log "Reusing existing $ENV_FILE"
+else
+    log "Creating $ENV_FILE with tu-zi gateway credentials"
 fi
 
 cat > "$ENV_FILE" <<EOF
-# Generated by RQ4 scripts/setup-openhands.sh — configures OpenHands Canvas
-# to authenticate with the local stack and points its LLM store at the
-# tu-zi gateway credentials below.
-#
-# These first two lines are consumed by run_openhands.sh — DO NOT delete them.
-LOCAL_BACKEND_API_KEY=${API_KEY:-REPLACE_ME_FROM_RUN_LOG}
-OH_SECRET_KEY=${SECRET_KEY:-REPLACE_ME_FROM_RUN_LOG}
-
-# tu-zi gateway credentials (OpenAI-compatible).
-# Note: OpenHands stores LLM settings server-side (encrypted with OH_SECRET_KEY).
-# These env vars are documentation only — use them when filling in Settings > LLM
-# in the web UI on first launch.
-TUZI_API_KEY=$TUZI_API_KEY
-TUZI_BASE_URL=$TUZI_BASE_URL
-
-# Default model (used in Settings > LLM > Custom Model field).
-DEFAULT_MODEL=$DEFAULT_MODEL
+# Generated by RQ4 scripts/setup-openhands.sh — credentials consumed by
+# agent/run_openhands.sh (sources this file then execs openhands with
+# --override-with-envs).
+LLM_API_KEY=$TUZI_API_KEY
+LLM_BASE_URL=$TUZI_BASE_URL
+LLM_MODEL=$DEFAULT_MODEL
 EOF
 chmod 600 "$ENV_FILE"
-log "Wrote $ENV_FILE (mode 600, generated=$GENERATED_KEYS)"
+log "Wrote $ENV_FILE (mode 600)"
 
 cat > "$ENV_EXAMPLE" <<'EOF'
-# OpenHands Canvas config — copy to .env and re-run setup-openhands.sh.
-# The first two keys are auto-generated on first run; leave placeholders here.
-LOCAL_BACKEND_API_KEY=
-OH_SECRET_KEY=
-
-# tu-zi gateway (OpenAI-compatible).
-TUZI_API_KEY=sk-replace-me
-TUZI_BASE_URL=https://api.tu-zi.com/v1
-
-# Default model string (provider prefix required, e.g. openai/gpt-4o-mini).
-DEFAULT_MODEL=openai/gpt-4o-mini
+# Copy to .env and re-run setup-openhands.sh.
+# These three vars are required by `openhands --override-with-envs`.
+LLM_API_KEY=sk-replace-me
+LLM_BASE_URL=https://api.tu-zi.com/v1
+LLM_MODEL=openai/gpt-4o-mini
 EOF
 log "Wrote $ENV_EXAMPLE"
 
 # ---------------------------------------------------------------------------
-# 4. README — how to point OpenHands at the tu-zi gateway via the web UI
+# 3. README — what this component is and how to use it
 # ---------------------------------------------------------------------------
 cat > "$README_FILE" <<EOF
-# Component 2 — OpenHands Agent Canvas
+# Component 2 — OpenHands CLI
 
-Upstream: <https://github.com/OpenHands/OpenHands>
-Installed via: \`npm install -g $OH_PACKAGE\`
-API gateway: <https://api.tu-zi.com> (OpenAI-compatible, configured via the web UI)
+Upstream: <https://github.com/OpenHands/OpenHands-CLI>
+Installed via (separate, one-time): \`curl -fsSL https://install.openhands.dev/install.sh | sh\`
+API gateway: <https://api.tu-zi.com> (OpenAI-compatible)
+
+## Why CLI, not Agent Canvas
+
+The npm-based [\`@openhands/agent-canvas\`](https://www.npmjs.com/package/@openhands/agent-canvas)
+spins up a web UI on port 8000. That's GUI. We want the same one-shot
+shape as component 1 (CLI takes a task, makes the changes, exits). The
+official \`OpenHands-CLI\` binary has a headless mode that matches.
 
 ## Boundary
 
 | Layer | Owner | Tracked? |
 | --- | --- | --- |
-| \`$OH_PACKAGE\` (global npm install) | npm registry | **No** (system-level) |
-| \`config/\` (our tracked config) | **RQ4** | Yes |
-
-## First-time LLM setup
-
-OpenHands stores LLM settings in an encrypted server-side store. They
-cannot be set via environment variables. After \`bash agent/run_openhands.sh\`:
-
-1. Open <http://localhost:8000> in a browser.
-2. Go to **Settings → LLM**.
-3. Toggle **Advanced**.
-4. Fill in:
-   - **Custom Model**: \`$DEFAULT_MODEL\`
-   - **Base URL**: \`$TUZI_BASE_URL\`
-   - **API Key**: \`$TUZI_API_KEY\`
-5. Click **Save Changes**.
-
-Subsequent conversations use the saved profile until you delete it.
+| \`openhands\` binary (\`~/.local/bin/openhands\`) | OpenHands installer | **No** (system-level) |
+| \`config/\`, \`run_openhands.sh\` | **RQ4** | Yes |
 
 ## Files
 
-- \`run_openhands.sh\` (parent dir) — wrapper that sources this \`.env\`,
-  then \`exec\`s \`agent-canvas\`.
-- \`.env\` — auto-generated API key (\`LOCAL_BACKEND_API_KEY\`) and secret
-  key (\`OH_SECRET_KEY\`). Gitignored, \`chmod 600\`.
+- \`run_openhands.sh\` (parent dir) — sources \`.env\`, then runs
+  \`openhands --headless --override-with-envs --yolo "\$@"\`.
+- \`.env\` — \`LLM_API_KEY\` / \`LLM_BASE_URL\` / \`LLM_MODEL\`. Gitignored, \`chmod 600\`.
 - \`.env.example\` — template.
-- \`smoke_test.sh\` — boots the stack, hits \`/alive\`, tears it down.
+- \`smoke_test.sh\` — issues a tiny task, verifies the artifact.
+
+## Usage
+
+\`\`\`bash
+# one-time bootstrap (assuming the binary is already installed)
+bash scripts/setup-openhands.sh
+
+# run a task — same shape as component 1
+bash agent/run_openhands.sh -t "fix the failing test in src/foo.py"
+\`\`\`
+
+> \`--yolo\` is auto-appended by the wrapper. Headless mode already
+> always auto-approves actions, so this is just defensive.
 EOF
 log "Wrote $README_FILE"
 
 # ---------------------------------------------------------------------------
-# 5. Wrapper script — single command to start the canvas
+# 4. Wrapper — single command to run a task
 # ---------------------------------------------------------------------------
 cat > "$RUNNER" <<EOF
 #!/usr/bin/env bash
-# run_openhands.sh — start OpenHands Agent Canvas with our env loaded.
-# Usage: bash agent/run_openhands.sh [agent-canvas options...]
+# run_openhands.sh — invoke the OpenHands CLI headless with our env loaded.
+# Usage: bash agent/run_openhands.sh -t "your task"   (or pass any openhands flags)
 set -euo pipefail
 REPO_ROOT="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")/.." && pwd)"
 set -a
 source "$ENV_FILE"
 set +a
-exec agent-canvas "\$@"
+exec openhands --headless --override-with-envs --yolo "\$@"
 EOF
 chmod +x "$RUNNER"
 log "Wrote $RUNNER"
 
 # ---------------------------------------------------------------------------
-# 6. Smoke test — boot, hit /alive, tear down
+# 5. Smoke test — actual end-to-end task run
 # ---------------------------------------------------------------------------
 cat > "$SMOKE" <<'BASH'
 #!/usr/bin/env bash
-# Smoke test: boot OpenHands Agent Canvas, wait for the ingress /alive
-# endpoint to return 200, then tear it down.
-#
-# We deliberately do NOT exercise the LLM here — that requires the user
-# to first save LLM settings via the web UI (see ../README.md).
+# Smoke test for the OpenHands CLI: issues a tiny task and verifies that
+# the agent actually produced the requested artifact. This exercises:
+#   - wrapper / .env loading
+#   - --override-with-envs flowing LLM_API_KEY / LLM_BASE_URL / LLM_MODEL
+#     into the CLI
+#   - the tu-zi gateway responding
+#   - the agent's tool-execution sandbox (writing files to a tmp dir)
 set -euo pipefail
 
-INGRESS_PORT="${INGRESS_PORT:-8000}"
-LOG_FILE="${LOG_FILE:-/tmp/openhands-smoke.log}"
-PID_FILE="${PID_FILE:-/tmp/openhands-smoke.pid}"
-
-echo "[smoke] starting agent-canvas (logs: $LOG_FILE)"
-agent-canvas >"$LOG_FILE" 2>&1 &
-PID=$!
-echo "$PID" >"$PID_FILE"
+WORK_DIR="$(mktemp -d /tmp/rq4-oh-smoke.XXXXXX)"
+EXPECTED_FILE="$WORK_DIR/smoke.txt"
+EXPECTED_CONTENT="rq4-component2-smoke"
+LOG_FILE="$WORK_DIR/trajectory.log"
 
 cleanup() {
-    if kill -0 "$PID" 2>/dev/null; then
-        echo "[smoke] killing agent-canvas (pid $PID)"
-        kill "$PID" 2>/dev/null || true
-        # give it a few seconds, then SIGKILL
-        for _ in 1 2 3 4 5; do
-            kill -0 "$PID" 2>/dev/null || break
-            sleep 1
-        done
-        if kill -0 "$PID" 2>/dev/null; then
-            kill -9 "$PID" 2>/dev/null || true
-        fi
-    fi
-    rm -f "$PID_FILE"
+    rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
 
-echo "[smoke] waiting for http://localhost:$INGRESS_PORT/alive (max 90s)"
-for i in $(seq 1 45); do
-    if curl -fsS -o /dev/null --max-time 2 "http://localhost:$INGRESS_PORT/alive"; then
-        echo "[smoke] OK: /alive returned 200 (after ${i}*2s)"
-        echo "SMOKE_OK"
-        exit 0
-    fi
-    if ! kill -0 "$PID" 2>/dev/null; then
-        echo "[smoke] FAIL: agent-canvas exited unexpectedly. Tail of log:" >&2
-        tail -n 50 "$LOG_FILE" >&2 || true
-        exit 1
-    fi
-    sleep 2
-done
+echo "[smoke] work dir:    $WORK_DIR"
+echo "[smoke] expected:     $EXPECTED_FILE"
+echo "[smoke] trajectory:   $LOG_FILE"
 
-echo "[smoke] FAIL: /alive did not return 200 within 90s. Tail of log:" >&2
-tail -n 80 "$LOG_FILE" >&2 || true
-exit 1
+cd "$WORK_DIR"
+# Issue a simple task the agent can complete in one turn.
+# Headless mode already auto-approves, but --yolo is defensive.
+openhands --headless --override-with-envs --yolo \
+    --exit-without-confirmation \
+    --json \
+    -t "Create a file at $EXPECTED_FILE containing exactly the text '$EXPECTED_CONTENT' (no other characters, no trailing newline). Just write the file and stop — do not run any other commands." \
+    >"$LOG_FILE" 2>&1
+
+if [[ ! -f "$EXPECTED_FILE" ]]; then
+    echo "[smoke] FAIL: $EXPECTED_FILE was not created." >&2
+    echo "[smoke] trajectory (tail):" >&2
+    tail -n 60 "$LOG_FILE" >&2 || true
+    exit 1
+fi
+
+ACTUAL_CONTENT="$(cat "$EXPECTED_FILE")"
+if [[ "$ACTUAL_CONTENT" != "$EXPECTED_CONTENT" ]]; then
+    echo "[smoke] FAIL: expected '$EXPECTED_CONTENT', got '$ACTUAL_CONTENT'" >&2
+    tail -n 60 "$LOG_FILE" >&2 || true
+    exit 1
+fi
+
+echo "[smoke] OK: $EXPECTED_FILE contains the requested text"
+echo "SMOKE_OK"
 BASH
 chmod +x "$SMOKE"
 log "Wrote $SMOKE"
 
 # ---------------------------------------------------------------------------
-# 7. Run smoke test
+# 6. Run smoke test
 # ---------------------------------------------------------------------------
-log "Running smoke test (boots agent-canvas, hits /alive)"
+log "Running smoke test (issues a tiny headless task via --override-with-envs)"
 set +e
 SMOKE_OUTPUT="$(bash "$SMOKE" 2>&1)"
 SMOKE_RC=$?
@@ -291,13 +239,11 @@ fi
 log "✅ Setup complete."
 log ""
 log "Next steps:"
-log "  1. bash agent/run_openhands.sh           # starts the canvas at http://localhost:8000"
-log "  2. open http://localhost:8000 in a browser"
-log "  3. Settings → LLM → Advanced → fill Custom Model / Base URL / API Key (see $README_FILE)"
+log "  bash agent/run_openhands.sh -t \"<your task>\"    # run a task (headless, auto-approve)"
 log ""
 log "Files of interest:"
 log "  • env loader   $ENV_FILE  (source it for custom runs)"
 log "  • config docs  $README_FILE"
 log "  • wrapper      $RUNNER"
 log "  • smoke test   $SMOKE"
-log "  • upstream     $OH_PACKAGE@$OH_PIN_VERSION  (global npm install)"
+log "  • upstream     openhands CLI  ($(command -v openhands))"

@@ -8,7 +8,7 @@ bootstrapped by its own setup script.
 | # | Name | Install | Setup |
 |---|------|---------|-------|
 | 1 | mini-swe-agent | `git clone` + `pip install -e` | [`scripts/setup.sh`](scripts/setup.sh) |
-| 2 | openhands (Agent Canvas) | `npm install -g @openhands/agent-canvas` | [`scripts/setup-openhands.sh`](scripts/setup-openhands.sh) |
+| 2 | openhands (CLI) | `curl -fsSL https://install.openhands.dev/install.sh \| sh` | [`scripts/setup-openhands.sh`](scripts/setup-openhands.sh) |
 
 All components route their LLM calls through a shared OpenAI-compatible
 gateway (`https://api.tu-zi.com`).
@@ -45,7 +45,7 @@ bash agent/run_openhands.sh
     │   └── smoke_test.py
     ├── openhands-config/    — component 2 config (tracked)
     │   ├── .env.example
-    │   ├── README.md        — how to wire LLM via the web UI
+    │   ├── README.md        — what this component is
     │   └── smoke_test.sh
     ├── .venv/               — Python venv (gitignored)
     └── mini-swe-agent/      — read-only upstream clone (gitignored)
