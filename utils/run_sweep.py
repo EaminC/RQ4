@@ -72,38 +72,76 @@ def write_jsonl(path: Path, rows: list[dict]) -> None:
 def write_markdown(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     n_total = rows[0]["train_size"] + rows[0]["test_size"] if rows else 0
-    lines: list[str] = []
-    lines.append("# Split sweep — train_size sweep × repeats × mode\n")
-    lines.append(f"Usable issues (with valid A–F category): **{n_total}**\n")
-    lines.append("Two modes per (train_size, repeat):\n"
-                 "- **default** = bounded per-repo cap (best-effort low leakage)\n"
-                 "- **repo_disjoint** = strict, whole repos moved between "
-                 "train/test → guarantees `leakage == 0`\n")
-    lines.append("| mode | req | rep | train | test | train % | "
-                 "unique repos | leakage % | cats covered |")
-    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---|")
-    for r in rows:
-        cats = r["train_category_counts"]
-        covered = sum(1 for c in "ABCDEF" if c in cats)
-        total_cats = 6
-        cats_str = f"{covered}/{total_cats}"
-        train_pct = round(100.0 * r["train_size"] / n_total, 1)
-        lines.append(
-            f"| {r['mode']} | {r['train_size_requested']} | {r['repeat']} | "
-            f"{r['train_size']} | {r['test_size']} | "
-            f"{train_pct} | {r['train_unique_repos']} | "
-            f"{r['test_repo_leakage_pct']} | {cats_str} |"
-        )
-    # Per-(mode, train_size) average row.
-    lines.append("")
-    lines.append("## Averages over the 3 repeats\n")
-    lines.append("| mode | req | train (mean) | test (mean) | "
-                 "leakage % (mean) | repos (mean) | cats covered |")
-    lines.append("|---|---:|---:|---:|---:|---:|---|")
+    modes = sorted({r["mode"] for r in rows})
     by_key: dict[tuple[str, int], list[dict]] = {}
     for r in rows:
         by_key.setdefault((r["mode"], r["train_size_requested"]), []).append(r)
-    for mode in ["default", "repo_disjoint"]:
+
+    lines: list[str] = []
+    lines.append("# Split sweep — train_size sweep × 3 repeats × mode\n")
+    lines.append(f"Usable issues (with valid A–F category): **{n_total}**\n")
+
+    # ------------------------------------------------------------------
+    # Strategy descriptions
+    # ------------------------------------------------------------------
+    lines.append("## Strategies\n")
+    lines.append(
+        "### Strategy A — `default` (bounded per-repo cap)\n"
+        "1. Compute per-category seed quotas via **largest-remainder "
+        "rounding** (snake / serpentine recall-merge), one issue per "
+        "quota slot.\n"
+        "2. For each category, prefer an issue from a repo we have not "
+        "yet claimed; fall back to an already-claimed repo only if the "
+        "unclaimed pool is exhausted.\n"
+        "3. After the seed phase, for every claimed repo R, pull in "
+        "additional issues up to a per-repo cap "
+        "`m_R = round(train_size / |claimed_repos|)` (largest-remainder "
+        "rounding so the total stays near `train_size`).\n"
+        "\n"
+        "**Goal**: train size ≈ requested, broad repo coverage, "
+        "low-but-not-zero leakage. On this 200-issue / 11-repo dataset "
+        "leakage is essentially 100% because the cap is a few issues "
+        "per repo, not the whole repo.\n"
+    )
+    lines.append(
+        "### Strategy B — `repo_disjoint` (strict, whole-repo isolation)\n"
+        "1. Decide how many repos `N` to claim: choose the smallest "
+        "`N` such that `Σ issue_counts[claimed_repos] ≥ train_size`.\n"
+        "2. Move **every** issue from each of those `N` repos to "
+        "train; everything else goes to test.\n"
+        "3. By construction, `test_repo_leakage_pct == 0`.\n"
+        "\n"
+        "**Goal**: zero contamination between train and test. Trade-off: "
+        "actual train size is coarse (whole repos), so it jumps in steps "
+        "and is rarely equal to the requested size.\n"
+    )
+
+    # ------------------------------------------------------------------
+    # Per-strategy section
+    # ------------------------------------------------------------------
+    for mode in modes:
+        lines.append(f"## Strategy `{mode}` — full table (per repeat)\n")
+        lines.append("| req | rep | train | test | train % | "
+                     "unique repos | leakage % | cats covered |")
+        lines.append("|---:|---:|---:|---:|---:|---:|---:|---|")
+        for r in rows:
+            if r["mode"] != mode:
+                continue
+            cats = r["train_category_counts"]
+            covered = sum(1 for c in "ABCDEF" if c in cats)
+            cats_str = f"{covered}/6"
+            train_pct = round(100.0 * r["train_size"] / n_total, 1)
+            lines.append(
+                f"| {r['train_size_requested']} | {r['repeat']} | "
+                f"{r['train_size']} | {r['test_size']} | "
+                f"{train_pct} | {r['train_unique_repos']} | "
+                f"{r['test_repo_leakage_pct']} | {cats_str} |"
+            )
+        lines.append("")
+        lines.append(f"### Strategy `{mode}` — averages over 3 repeats\n")
+        lines.append("| req | train (mean) | test (mean) | "
+                     "leakage % (mean) | repos (mean) | cats covered |")
+        lines.append("|---:|---:|---:|---:|---:|---|")
         for ts in sorted({k[1] for k in by_key if k[0] == mode}):
             rep_rows = by_key[(mode, ts)]
             n = len(rep_rows)
@@ -116,9 +154,40 @@ def write_markdown(path: Path, rows: list[dict]) -> None:
                 if all(c in x["train_category_counts"] for x in rep_rows)
             )
             lines.append(
-                f"| {mode} | {ts} | {avg_train:.1f} | {avg_test:.1f} | "
+                f"| {ts} | {avg_train:.1f} | {avg_test:.1f} | "
                 f"{avg_leak:.1f} | {avg_repos:.1f} | {covered}/6 |"
             )
+        lines.append("")
+
+    # ------------------------------------------------------------------
+    # Side-by-side averages
+    # ------------------------------------------------------------------
+    lines.append("## Side-by-side comparison — averages over 3 repeats\n")
+    lines.append("| req | A train | A leakage | A cats | "
+                 "B train | B leakage | B cats |")
+    lines.append("|---:|---:|---:|---:|---:|---:|---|")
+    ts_set = sorted({r["train_size_requested"] for r in rows})
+    for ts in ts_set:
+        a = by_key.get(("default", ts), [])
+        b = by_key.get(("repo_disjoint", ts), [])
+        if not a or not b:
+            continue
+        a_train = sum(x["train_size"] for x in a) / len(a)
+        a_leak = sum(x["test_repo_leakage_pct"] for x in a) / len(a)
+        a_cats = sum(
+            1 for c in "ABCDEF"
+            if all(c in x["train_category_counts"] for x in a)
+        )
+        b_train = sum(x["train_size"] for x in b) / len(b)
+        b_leak = sum(x["test_repo_leakage_pct"] for x in b) / len(b)
+        b_cats = sum(
+            1 for c in "ABCDEF"
+            if all(c in x["train_category_counts"] for x in b)
+        )
+        lines.append(
+            f"| {ts} | {a_train:.1f} | {a_leak:.1f} | {a_cats}/6 | "
+            f"{b_train:.1f} | {b_leak:.1f} | {b_cats}/6 |"
+        )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
