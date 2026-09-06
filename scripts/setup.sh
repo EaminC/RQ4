@@ -131,6 +131,23 @@ EOF
 chmod 600 "$ENV_FILE"
 log "Wrote $ENV_FILE (mode 600)"
 
+# Write a fresh .env.example alongside it so re-clones / clean rebuilds
+# don't drop the template that's tracked in git.
+cat > "$CONFIG_DIR/.env.example" <<EOF
+# tu-zi gateway credentials (OpenAI-compatible).
+# Copy this file to \`.env\` and fill in the real key, or let scripts/setup.sh
+# generate \`.env\` with a sensible default.
+TUZI_API_KEY=sk-replace-me
+TUZI_BASE_URL=https://api.tu-zi.com/v1
+
+# Default model. Format: openai/<model-id> (litellm routes via the env vars above).
+DEFAULT_MODEL=openai/gpt-4o-mini
+
+# Per-run cost limit in USD.
+COST_LIMIT=3.0
+EOF
+log "Wrote $CONFIG_DIR/.env.example"
+
 # ---------------------------------------------------------------------------
 # 5. mini.yaml — non-default agent options (cost cap, yolo)
 # ---------------------------------------------------------------------------
