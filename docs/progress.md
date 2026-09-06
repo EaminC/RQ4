@@ -3,7 +3,7 @@
 
 This file summarizes what has been built, what was learned, and what is
 next. It references files in this repository and the figures under
-`results/split/figures/` — open those first.
+`../results/split/figures/` — open those first.
 
 ---
 
@@ -66,9 +66,9 @@ D is the rare class — only 15 issues total.
 bottom-5 together contribute ~5 %.
 
 See:
-- `results/split/figures/01_per_repo_counts.png`
-- `results/split/figures/02_per_category_counts.png`
-- `results/split/figures/08_repo_size_distribution.png`
+- `../results/split/figures/01_per_repo_counts.png`
+- `../results/split/figures/02_per_category_counts.png`
+- `../results/split/figures/08_repo_size_distribution.png`
 
 ---
 
@@ -130,10 +130,10 @@ Source: `results/split/sweep.md`, side-by-side table.
 | 180 | 184.3 | 100.0 % | 172.3 | **0.0 %** | 188.0 | 100.0 % |
 
 See:
-- `results/split/figures/04_train_size_vs_actual.png`
-- `results/split/figures/05_leakage_vs_train_size.png`
-- `results/split/figures/06_cats_coverage_vs_train_size.png`
-- `results/split/figures/07_strategy_comparison.png`
+- `../results/split/figures/04_train_size_vs_actual.png`
+- `../results/split/figures/05_leakage_vs_train_size.png`
+- `../results/split/figures/06_cats_coverage_vs_train_size.png`
+- `../results/split/figures/07_strategy_comparison.png`
 
 ---
 
