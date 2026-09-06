@@ -27,7 +27,13 @@ to write.
   Each contains `SKILL.md`, `fallback_generic_fix.md`, `manifest.json`,
   and `repos/<owner>__<name>.md`.
 - Verify pool (`data/verify/_pool/<issue-id>/`, gitignored) — 192
-  unique dirs, 63 MB, all patch fields stripped.
+  unique dirs, **~4.6 MB**, all patch fields stripped, **exactly 3
+  files per directory** (`env.dockerfile`, the
+  `agentsmith_fail2pass_<NNN>.py` test, and the rewritten
+  `issue.json`). Built and audited by
+  `utils/verify/build_verify.py --force-pool --audit` using the
+  default `--strict` 3-file mode. The legacy 7-file mode is still
+  reachable via `--no-strict` for forensic debug only.
 - 6 per-skill indices (`data/verify/issue_index_<agent>_<train_size>.jsonl`,
   gitignored) — 200 rows each, `split=0` (train) / `split=1` (test).
 - `utils/verify/build_verify.py` is the canonical rebuilder. It is
@@ -67,7 +73,13 @@ so we can report per-skill lift.
   Repo leakage is **0%** for all 6.
 - The verify pool's job is to make sure the agent **cannot read the
   gold patch**. The leak audit (`data/verify/audit.json`) currently
-  reports `192/192 issues clean`.
+  reports `192/192 issues clean`. Every entry passes:
+  - `absent:generated_patch.diff` — the gold diff file never copied;
+  - `issue_json_no_patch_keys` — `linked_prs[].{patch, base_sha,
+    head_sha}` all stripped;
+  - `strict_3_file_invariant` — every verify dir contains exactly
+    `env.dockerfile`, `issue.json`, and one
+    `agentsmith_fail2pass_<NNN>.py`. Nothing else.
 
 ---
 
@@ -81,7 +93,7 @@ so we can report per-skill lift.
 | `agent/run_mini.sh` | wrapper for mini-swe-agent (component 1) |
 | `agent/run_openhands.sh` | wrapper for openhands (component 2) |
 | `agent/config/mini.yaml` | mini-swe-agent config (LLM endpoint, etc.) |
-| `utils/verify/build_verify.py` | reference for reading index rows, pool layout |
+| `utils/verify/build_verify.py` | reference for reading index rows, pool layout, and the strict 3-file invariant |
 | `utils/train/train_skill.py` | reference for how SKILL.md gets injected |
 | `docs/progress.md` §6.4, §7, §8 | status, next, and reproduce |
 
@@ -174,11 +186,13 @@ Key questions you need to answer before coding:
    the pool, so your solver will find it under that name in
    `data/verify/_pool/<id>/`. Don't get confused by the raw dir
    naming.
-3. **`run.log` was kept in 15/200 pool dirs.** The other 185 were
-   dropped because they contained `diff --git` headers (the agent's
-   own attempted patch output). The pool is therefore not
-   byte-identical to the raw dir — make sure you read the **pool**,
-   not the raw.
+3. **The pool has exactly 3 files per dir under `--strict`.** No
+   `run.log`, no `summary.json`, no `f2p.txt`, no `dockerbuild.txt`,
+   no `agentsmith_stat.json`. If you re-run without `--strict`
+   (legacy mode) you will see all 7 files; release audits always use
+   the default strict 3-file invariant. If you see `run.log`,
+   `summary.json`, etc. in `_pool/`, something regenerated without
+   `--strict` and you must rebuild.
 4. **`*.hallucinated.*` validator rejects.** `utils/train/train_skill.py`
    writes a draft per-repo skill file, validates it, and on failure
    writes the bad draft as `repos/<owner>__<name>.md.hallucinated.<N>`
@@ -217,9 +231,12 @@ Key questions you need to answer before coding:
       assert not viol, f"{sz_from}->{sz_to}: {len(viol)} monotonicity violations"
   print("OK")
   ```
-- `du -sh data/verify/_pool/` reports ~63 MB. If it grows back to
-  ~200 MB, `run.log` filtering regressed.
-- `data/verify/audit.json` should still have all `ok: true` checks.
+- `du -sh data/verify/_pool/` reports ~4.6 MB. If it grows past
+  ~6 MB, `--force-pool` was run without `--strict` and the
+  `summary.json` / `run.log` filtering regressed — re-run with the
+  default `--strict`.
+- `data/verify/audit.json` should still have every entry marked
+  `ok: true`, including the new `strict_3_file_invariant` check.
 
 ---
 

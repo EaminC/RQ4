@@ -435,20 +435,25 @@ full sweep.
 
 1. **`data/verify/_pool/<issue-id>/`** — a *patch-stripped* copy of
    every raw issue directory (`data/raw/results/all_combined_f2p/...`).
-   192 unique dirs, 63 MB total, 185/200 `run.log` files dropped
-   because they contain the agent's attempted patch diffs (a leak
-   vector). For each issue:
-   - `issue_<NNN>.json` is rewritten with the gold patch removed:
+   192 unique dirs, **4.6 MB total** (under `--strict`, the default),
+   exactly **3 files per directory**:
+   - `env.dockerfile` — kept verbatim.
+   - `agentsmith_fail2pass_<NNN>.py` — the f2p test, kept verbatim
+     (filename varies by issue).
+   - `issue.json` — rewritten with the gold patch removed:
      `linked_prs[].patch`, `linked_prs[].base_sha`,
      `linked_prs[].head_sha` are stripped. Public PR metadata
      (number, state, title, url, merged, base_branch) is
      preserved.
-   - `generated_patch.diff` is never copied (115 raw dirs had it).
-   - `run.log` / `f2p.txt` / `dockerbuild.txt` are copied only if
-     diff-free (their default heuristic is `diff --git ` literal or
-     a `@@` hunk header anywhere in the file).
-   - `env.dockerfile`, `agentsmith_fail2pass_*.py`, `summary.json`,
-     `agentsmith_stat.json` are copied verbatim.
+   - **`generated_patch.diff`** is never copied (115 raw dirs had
+     it). `summary.json` / `agentsmith_stat.json` /
+     `run.log` / `f2p.txt` / `dockerbuild.txt` are unconditionally
+     dropped under `--strict`; they are only kept under the legacy
+     `--no-strict` mode for forensic debugging of the pipeline
+     itself.
+   The strict 3-file invariant is the *only* contract the release
+   audit checks against; downstream `solve.py` (Component 6) is
+   written against it.
 2. **Six per-skill indices**,
    `data/verify/issue_index_<agent>_<train_size>.jsonl`, one row per
    issue (200 rows each), `split ∈ {0, 1}`:
@@ -475,9 +480,15 @@ train at `train_size=60` and `80` (0 violations across the 200
 issues). Same-size / cross-agent agreement: 0 mismatches.
 
 A `verify_manifest.json` records the per-split counts and a leak
-audit (`audit.json`) reports `192/192 issues clean`. Run again any
-time with `python utils/verify/build_verify.py --audit` (idempotent;
-`--force-pool` rebuilds the pool from scratch).
+audit (`audit.json`) reports `192/192 issues clean` — every issue
+passes `absent:generated_patch.diff`, `issue_json_no_patch_keys`,
+**and the `strict_3_file_invariant`** (exactly
+`env.dockerfile + issue.json + 1 agentsmith_fail2pass_*.py`,
+nothing else). Run again any time with
+`python utils/verify/build_verify.py --audit` (idempotent;
+`--force-pool` rebuilds the pool from scratch, accepting the default
+`--strict` 3-file mode; pass `--no-strict` to switch back to the
+legacy 7-file mode for debugging the pipeline itself).
 
 The next step (§7) is to drive the agent on every `split=1` issue in
 each of the 6 indices, with and without the corresponding
@@ -542,8 +553,10 @@ python utils/split/run.py \
 bash utils/train/run_all.sh
 
 # 6. Build the verify pool + 6 per-skill indices
-python utils/verify/build_verify.py            # idempotent
-python utils/verify/build_verify.py --audit    # + leak-vector scan
+python utils/verify/build_verify.py            # idempotent (--strict default)
+python utils/verify/build_verify.py --audit    # + leak-vector scan + 3-file invariant
+# forensic: rebuild the legacy 7-file pool (only for debugging the pipeline)
+python utils/verify/build_verify.py --force-pool --no-strict --audit
 
 # 7. (next) Run the solve loop on every test issue in every skill
 python utils/verify/solve.py \

@@ -20,18 +20,15 @@ Everything else (the test file, the dockerfile, run logs that don't
 contain diffs) is harmless to keep — those don't leak the solution.
 
 Outputs (created on first run, reused on subsequent runs unless
-``--force`` is passed):
+``--force-pool`` is passed). Under the **default ``--strict`` mode** each
+verify directory contains exactly three files — all metadata, build
+logs, and agent run logs are excluded from the pool:
 
     data/verify/
         _pool/<issue_id>/                 # one stripped copy per issue (200 total)
             issue.json                    # patch-stripped metadata
-            agentsmith_fail2pass_<NNN>.py
-            env.dockerfile
-            summary.json
-            agentsmith_stat.json
-            f2p.txt                       # run log, no diff
-            dockerbuild.txt               # build log, no diff
-            run.log                       # run log, no diff (may be large)
+            agentsmith_fail2pass_<NNN>.py # the f2p test (kept verbatim)
+            env.dockerfile                # docker build context
 
         issue_index_<agent>_<train_size>.jsonl
             # One row per issue for a *specific* split. Fields:
@@ -63,14 +60,17 @@ Usage
     # build pool + 6 indices (idempotent; respects existing pool)
     python utils/verify/build_verify.py
 
-    # rebuild pool from scratch
+    # rebuild pool from scratch (strict 3-file mode by default)
     python utils/verify/build_verify.py --force-pool
 
-    # regenerate only the index files (no copy)
+    # regenerate only the index files (no pool copy)
     python utils/verify/build_verify.py --skip-pool
 
-    # validate that no leak vector survived
+    # validate that no leak vector survived + 3-file invariant
     python utils/verify/build_verify.py --audit
+
+    # legacy 7-file mode (forensic / debug only; LEAKS auxiliary info)
+    python utils/verify/build_verify.py --force-pool --no-strict
 """
 from __future__ import annotations
 
@@ -119,11 +119,33 @@ DROP_FILES = ("generated_patch.diff",)                    # whole file = patch
 
 #: These are run logs. We audit them for `diff --git` / `@@` hunks
 #: before deciding. If they contain diff hunks, we drop them.
+#: Under the default ``--strict`` mode these are unconditionally dropped,
+#: regardless of whether they look diff-free, so the pool stays minimal.
 RUN_LOG_FILES = ("f2p.txt", "dockerbuild.txt", "run.log")
 DIFF_MARKERS = ("diff --git ", "\n@@ ", "\n+++ ", "\n--- ")
 
 #: Metadata files with no leakage risk — kept verbatim.
+#: Under ``--strict`` these are also unconditionally dropped to keep the
+#: pool interface surface as small as possible (the verifier only needs
+#: ``issue.json`` + the test + ``env.dockerfile``).
 META_FILES = ("summary.json", "agentsmith_stat.json")
+
+#: Set of files allowed to exist in a verify pool dir under --strict.
+#: Anything else (summary.json, run logs, generated_patch.diff, …)
+#: must be absent.
+STRICT_DROP_FILES = (
+    "generated_patch.diff",
+    "summary.json",
+    "agentsmith_stat.json",
+    "f2p.txt",
+    "dockerbuild.txt",
+    "run.log",
+)
+
+#: Default policy. ``--strict`` is the **only** mode that the released
+#: audit considers safe; ``--no-strict`` is retained for debugging the
+#: pipeline itself (e.g. inspecting why a run log was generated).
+DEFAULT_STRICT = True
 
 # ---------------------------------------------------------------------------
 # Issue-id helpers
@@ -227,7 +249,8 @@ def _copy_text(src: Path, dst: Path, *, must_be_diff_free: bool) -> str:
     return "kept"
 
 
-def _build_one_issue(row: dict[str, Any], force: bool) -> dict[str, Any]:
+def _build_one_issue(row: dict[str, Any], force: bool,
+                     strict: bool = DEFAULT_STRICT) -> dict[str, Any]:
     """Materialise a stripped verify dir for a single issue.
 
     Returns a small dict describing what was written; useful for the
@@ -255,7 +278,17 @@ def _build_one_issue(row: dict[str, Any], force: bool) -> dict[str, Any]:
         "verify_dir": str(verify_dir.relative_to(REPO_ROOT)),
         "files": {},
         "ok": True,
+        "strict": strict,
     }
+
+    # 0. Strict-mode clean sweep. If the pool dir previously held files
+    # from a non-strict build (summary.json, run.log, …), get rid of them
+    # up front so we end up with exactly the 3 files we want.
+    if strict:
+        for stray in verify_dir.iterdir():
+            if stray.is_file():
+                stray.unlink()
+        audit["strict_cleaned"] = True
 
     # 1. Stripped metadata.
     issue_json_raw = _find_issue_json(raw_dir)
@@ -280,26 +313,36 @@ def _build_one_issue(row: dict[str, Any], force: bool) -> dict[str, Any]:
     audit["files"][test_file.name] = "kept"
     audit["test_relpath"] = f"tests/{test_file.name}"
 
-    # 3. Dockerfile + meta files — keep verbatim.
-    for fname in KEEP_FILES + META_FILES:
+    # 3. Dockerfile — kept under both modes. Meta files only in non-strict.
+    for fname in KEEP_FILES:
         status = _copy_text(raw_dir / fname, verify_dir / fname,
                             must_be_diff_free=False)
         audit["files"][fname] = status
+    if not strict:
+        for fname in META_FILES:
+            status = _copy_text(raw_dir / fname, verify_dir / fname,
+                                must_be_diff_free=False)
+            audit["files"][fname] = status
 
-    # 4. Run logs — only keep if diff-free.
-    for fname in RUN_LOG_FILES:
-        status = _copy_text(raw_dir / fname, verify_dir / fname,
-                            must_be_diff_free=True)
-        audit["files"][fname] = status
+    # 4. Run logs — under strict they are unconditionally dropped;
+    # otherwise we copy them only if diff-free.
+    if strict:
+        for fname in RUN_LOG_FILES:
+            audit["files"][fname] = "dropped_strict"
+    else:
+        for fname in RUN_LOG_FILES:
+            status = _copy_text(raw_dir / fname, verify_dir / fname,
+                                must_be_diff_free=True)
+            audit["files"][fname] = status
 
-    # 5. Hard-drop the gold-patch file (if present).
+    # 5. Hard-drop the gold-patch file (if present in either raw or pool).
     drop = raw_dir / "generated_patch.diff"
     if drop.exists():
         # Make sure it does NOT end up in verify_dir.
         leaked = verify_dir / "generated_patch.diff"
         if leaked.exists():
             leaked.unlink()
-        audit["files"]["generated_patch.diff"] = "dropped"
+    audit["files"]["generated_patch.diff"] = "dropped"
 
     return audit
 
@@ -323,11 +366,12 @@ def _audit_one_issue(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_pool(index_rows: list[dict[str, Any]],
-               force: bool = False) -> list[dict[str, Any]]:
+               force: bool = False,
+               strict: bool = DEFAULT_STRICT) -> list[dict[str, Any]]:
     audits: list[dict[str, Any]] = []
     for row in index_rows:
         try:
-            audits.append(_build_one_issue(row, force=force))
+            audits.append(_build_one_issue(row, force=force, strict=strict))
         except Exception as exc:
             audits.append({"id": row.get("id"), "ok": False,
                            "reason": f"exception:{exc!r}",
@@ -513,19 +557,35 @@ def build_index(agent: str, train_size: int, index_rows: list[dict[str, Any]]
 LEAK_PATH_NEVER_EXISTS = ("generated_patch.diff",)
 
 
-def audit_pool() -> list[dict[str, Any]]:
-    """Walk the pool and confirm no leak vector survived."""
+def _pool_file_set(verify_dir: Path) -> set[str]:
+    """Set of file names currently present in a verify pool dir."""
+    return {p.name for p in verify_dir.iterdir() if p.is_file()} if verify_dir.exists() else set()
+
+
+def audit_pool(strict: bool = DEFAULT_STRICT) -> list[dict[str, Any]]:
+    """Walk the pool and confirm no leak vector survived.
+
+    Under ``strict`` mode (the default) we additionally enforce that every
+    verify dir contains exactly the allowed 3-file set:
+
+        - ``env.dockerfile``
+        - ``issue.json``
+        - exactly one ``agentsmith_fail2pass_<NNN>.py``
+
+    Anything else (``summary.json``, ``run.log``, ``generated_patch.diff``,
+    …) is treated as a leak and the issue is marked ``ok=False``.
+    """
     findings: list[dict[str, Any]] = []
     if not POOL_DIR.exists():
         return [{"ok": False, "reason": "pool_dir_missing"}]
     for issue_dir in sorted(POOL_DIR.iterdir()):
         finding: dict[str, Any] = {"id": issue_dir.name, "checks": []}
+        files = _pool_file_set(issue_dir)
         # 1. generated_patch.diff must NOT exist.
         for bad in LEAK_PATH_NEVER_EXISTS:
-            p = issue_dir / bad
             finding["checks"].append({
                 "check": f"absent:{bad}",
-                "ok": not p.exists(),
+                "ok": bad not in files,
             })
         # 2. issue.json must have no `patch` keys.
         ij = issue_dir / "issue.json"
@@ -550,16 +610,34 @@ def audit_pool() -> list[dict[str, Any]]:
                     "check": "issue_json_no_patch_keys",
                     "ok": False, "reason": str(exc),
                 })
-        # 3. No run log may contain diff markers.
-        for fname in RUN_LOG_FILES:
-            p = issue_dir / fname
-            if p.exists():
-                text = p.read_text(encoding="utf-8", errors="replace")
-                has_diff = _has_diff_marker(text)
-                finding["checks"].append({
-                    "check": f"runlog_diff_free:{fname}",
-                    "ok": not has_diff,
-                })
+        # 3. No run log may contain diff markers (non-strict only —
+        #    strict mode never copies run logs in the first place).
+        if not strict:
+            for fname in RUN_LOG_FILES:
+                p = issue_dir / fname
+                if p.exists():
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                    has_diff = _has_diff_marker(text)
+                    finding["checks"].append({
+                        "check": f"runlog_diff_free:{fname}",
+                        "ok": not has_diff,
+                    })
+        # 4. Strict invariant: exactly the allowed 3 files.
+        if strict:
+            test_files = [f for f in files if f.startswith("agentsmith_fail2pass_")]
+            required_present = {"issue.json", "env.dockerfile"}
+            required_absent = set(STRICT_DROP_FILES)
+            finding["checks"].append({
+                "check": "strict_3_file_invariant",
+                "ok": (len(test_files) == 1
+                       and required_present.issubset(files)
+                       and not (files & required_absent)
+                       and len(files) == 3),
+                "files_present": sorted(files),
+                "files_required_absent": sorted(required_absent & files),
+                "files_required_present": sorted(required_present - files),
+                "n_test_files": len(test_files),
+            })
         finding["ok"] = all(c.get("ok") for c in finding["checks"])
         findings.append(finding)
     return findings
@@ -591,6 +669,15 @@ def main() -> None:
     p.add_argument("--audit", action="store_true",
                    help="After (re)building, scan the pool for surviving "
                         "leak vectors.")
+    p.add_argument("--strict", dest="strict", action="store_true",
+                   default=DEFAULT_STRICT,
+                   help="Strict 3-file pool mode (default): each verify "
+                        "dir contains only env.dockerfile, issue.json, "
+                        "and the test file. All run logs + meta files "
+                        "are unconditionally dropped.")
+    p.add_argument("--no-strict", dest="strict", action="store_false",
+                   help="Legacy mode (forensic / debug only): copy run "
+                        "logs and meta files when they look diff-free.")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args()
 
@@ -604,7 +691,9 @@ def main() -> None:
     if not args.skip_pool:
         if args.force_pool and POOL_DIR.exists():
             shutil.rmtree(POOL_DIR)
-        audits = build_pool(index_rows, force=args.force_pool)
+        print(f"[pool] strict={args.strict}, force={args.force_pool}")
+        audits = build_pool(index_rows, force=args.force_pool,
+                            strict=args.strict)
         n_ok = sum(1 for a in audits if a.get("ok"))
         n_bad = len(audits) - n_ok
         print(f"[pool] built {n_ok}/{len(audits)} verify dirs under "
@@ -643,13 +732,14 @@ def main() -> None:
                          for a, t in SKILL_SPLITS],
         "split_mode": SPLIT_MODE,
         "split_seed": SPLIT_SEED,
+        "strict": args.strict,
     }, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[idx] manifest: {manifest_path.relative_to(REPO_ROOT)}")
 
     # 4. Audit (optional).
     if args.audit:
-        print("[audit] scanning verify pool for leak vectors ...")
-        findings = audit_pool()
+        print(f"[audit] scanning verify pool (strict={args.strict}) ...")
+        findings = audit_pool(strict=args.strict)
         n_ok = sum(1 for f in findings if f.get("ok"))
         n_bad = len(findings) - n_ok
         print(f"[audit] {n_ok}/{len(findings)} issues clean")
