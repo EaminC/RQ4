@@ -274,6 +274,81 @@ def _seed_train_repo_disjoint(
     return train_rows, claimed_set
 
 
+# ---------------------------------------------------------------------------
+# Greedy issue-level split — hit train_size exactly
+# ---------------------------------------------------------------------------
+def _seed_train_greedy_issue(
+    rows: list[dict[str, Any]], train_size: int, rng: random.Random
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Greedy issue-level split.
+
+    Goal: hit ``train_size`` exactly, cover every category, minimise
+    repo leakage. Accepts that leakage may be > 0 once we exhaust the
+    fresh-repo pool.
+
+    Algorithm
+    ---------
+    Pass 1: pick up to one issue per (repo, category) cell, preferring
+    cells that are still uncovered. This round-fill pass maximises
+    coverage of both repos and categories.
+    Pass 2: if we still need more issues to reach ``train_size``, top
+    up from the remaining pool, smallest claimed-repo first.
+    """
+    by_cat: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        if r.get("category") in {"A", "B", "C", "D", "E", "F"}:
+            by_cat[r["category"]].append(r)
+    for c in by_cat:
+        rng.shuffle(by_cat[c])
+
+    taken_cells: set[tuple[str, str]] = set()
+    claimed_repos: set[str] = set()
+    train_ids: set[str] = set()
+    repo_count: Counter = Counter()
+
+    cats_to_cover = sorted(by_cat)
+
+    def try_add(r: dict[str, Any]) -> bool:
+        nonlocal train_ids
+        if len(train_ids) >= train_size:
+            return False
+        if r["id"] in train_ids:
+            return False
+        train_ids.add(r["id"])
+        if r.get("repo"):
+            claimed_repos.add(r["repo"])
+            repo_count[r["repo"]] += 1
+        return True
+
+    # Pass 1: snake through categories, prefer unclaimed repos.
+    for cat in cats_to_cover:
+        if len(train_ids) >= train_size:
+            break
+        for r in by_cat[cat]:
+            if len(train_ids) >= train_size:
+                break
+            repo = r.get("repo")
+            cell = (repo, cat)
+            if cell in taken_cells:
+                continue
+            taken_cells.add(cell)
+            try_add(r)
+
+    # Pass 2: top up, smallest-claimed-repo first.
+    if len(train_ids) < train_size:
+        for r in rows:
+            if len(train_ids) >= train_size:
+                break
+            if r["id"] in train_ids:
+                continue
+            if r.get("category") not in {"A", "B", "C", "D", "E", "F"}:
+                continue
+            try_add(r)
+
+    train_rows = [r for r in rows if r["id"] in train_ids]
+    return train_rows, claimed_repos
+
+
 def split(index: list[dict[str, Any]], train_size: int, seed: int = 0,
           mode: str = "default"
           ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
@@ -288,6 +363,8 @@ def split(index: list[dict[str, Any]], train_size: int, seed: int = 0,
         sys.exit(f"train_size ({train_size}) >= usable issues ({len(usable)})")
     if mode == "repo_disjoint":
         train, claimed = _seed_train_repo_disjoint(usable, train_size, rng)
+    elif mode == "greedy_issue":
+        train, claimed = _seed_train_greedy_issue(usable, train_size, rng)
     elif mode == "default":
         train, claimed = _seed_train(usable, train_size, rng)
     else:
@@ -329,12 +406,17 @@ def main() -> None:
                         "summary.json inside.")
     p.add_argument("--train-size", type=int, default=40)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--mode", choices=["default", "repo_disjoint"],
+    p.add_argument("--mode",
+                   choices=["default", "repo_disjoint", "greedy_issue"],
                    default="default",
                    help="default = bounded per-repo cap (best-effort "
-                        "low leakage). repo_disjoint = strict, "
-                        "guarantees test_repo_leakage_pct == 0 by "
-                        "moving whole repos between train/test.")
+                        "low leakage). "
+                        "repo_disjoint = strict, guarantees "
+                        "test_repo_leakage_pct == 0 by moving whole "
+                        "repos between train/test. "
+                        "greedy_issue = hit train_size exactly by "
+                        "snaking through (repo, category) cells; "
+                        "leakage may be > 0.")
     args = p.parse_args()
 
     rows = load_index(args.index)

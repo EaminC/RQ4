@@ -37,28 +37,16 @@ def run_sweep(index: list[dict], train_sizes: list[int], repeats: int
     for ts in train_sizes:
         for rep in range(repeats):
             seed = 1000 * rep + ts  # deterministic per (ts, rep)
-            # default (bounded cap) mode
-            train, test, summary = split_mod.split(index, ts, seed=seed,
-                                                   mode="default")
-            row_default = {
-                "mode": "default",
-                "train_size_requested": ts,
-                "repeat": rep,
-                "seed": seed,
-                **summary,
-            }
-            # repo_disjoint (strict) mode
-            train, test, summary_rd = split_mod.split(index, ts, seed=seed,
-                                                      mode="repo_disjoint")
-            row_rd = {
-                "mode": "repo_disjoint",
-                "train_size_requested": ts,
-                "repeat": rep,
-                "seed": seed,
-                **summary_rd,
-            }
-            rows.append(row_default)
-            rows.append(row_rd)
+            for mode in ("default", "repo_disjoint", "greedy_issue"):
+                _, _, summary = split_mod.split(index, ts, seed=seed,
+                                                mode=mode)
+                rows.append({
+                    "mode": mode,
+                    "train_size_requested": ts,
+                    "repeat": rep,
+                    "seed": seed,
+                    **summary,
+                })
     return rows
 
 
@@ -119,6 +107,19 @@ def write_markdown(path: Path, rows: list[dict]) -> None:
     # ------------------------------------------------------------------
     # Per-strategy section
     # ------------------------------------------------------------------
+    lines.append(
+        "### Strategy C — `greedy_issue` (issue-level greedy)\n"
+        "1. Snake through the **6 categories × 11 repos** cross-tab; "
+        "at each step pick an issue from the next (repo, category) "
+        "cell.\n"
+        "2. If we still need more issues to hit `train_size`, top up "
+        "from the smallest-claimed-repo pool.\n"
+        "\n"
+        "**Goal**: hit `train_size` exactly, maximise coverage of "
+        "both repos and categories. Trade-off: once we exhaust the "
+        "fresh-repo pool we must reuse claimed repos, so leakage is "
+        "no longer guaranteed to be 0.\n"
+    )
     for mode in modes:
         lines.append(f"## Strategy `{mode}` — full table (per repeat)\n")
         lines.append("| req | rep | train | test | train % | "
@@ -164,29 +165,38 @@ def write_markdown(path: Path, rows: list[dict]) -> None:
     # ------------------------------------------------------------------
     lines.append("## Side-by-side comparison — averages over 3 repeats\n")
     lines.append("| req | A train | A leakage | A cats | "
-                 "B train | B leakage | B cats |")
-    lines.append("|---:|---:|---:|---:|---:|---:|---|")
+                 "B train | B leakage | B cats | "
+                 "C train | C leakage | C cats |")
+    lines.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
     ts_set = sorted({r["train_size_requested"] for r in rows})
     for ts in ts_set:
         a = by_key.get(("default", ts), [])
         b = by_key.get(("repo_disjoint", ts), [])
-        if not a or not b:
+        c = by_key.get(("greedy_issue", ts), [])
+        if not a or not b or not c:
             continue
         a_train = sum(x["train_size"] for x in a) / len(a)
         a_leak = sum(x["test_repo_leakage_pct"] for x in a) / len(a)
         a_cats = sum(
-            1 for c in "ABCDEF"
-            if all(c in x["train_category_counts"] for x in a)
+            1 for c2 in "ABCDEF"
+            if all(c2 in x["train_category_counts"] for x in a)
         )
         b_train = sum(x["train_size"] for x in b) / len(b)
         b_leak = sum(x["test_repo_leakage_pct"] for x in b) / len(b)
         b_cats = sum(
-            1 for c in "ABCDEF"
-            if all(c in x["train_category_counts"] for x in b)
+            1 for c2 in "ABCDEF"
+            if all(c2 in x["train_category_counts"] for x in b)
+        )
+        c_train = sum(x["train_size"] for x in c) / len(c)
+        c_leak = sum(x["test_repo_leakage_pct"] for x in c) / len(c)
+        c_cats = sum(
+            1 for c2 in "ABCDEF"
+            if all(c2 in x["train_category_counts"] for x in c)
         )
         lines.append(
             f"| {ts} | {a_train:.1f} | {a_leak:.1f} | {a_cats}/6 | "
-            f"{b_train:.1f} | {b_leak:.1f} | {b_cats}/6 |"
+            f"{b_train:.1f} | {b_leak:.1f} | {b_cats}/6 | "
+            f"{c_train:.1f} | {c_leak:.1f} | {c_cats}/6 |"
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
