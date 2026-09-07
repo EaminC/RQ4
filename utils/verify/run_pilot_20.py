@@ -43,7 +43,8 @@ def main() -> int:
     p.add_argument("--cost-limit", type=float, default=3.0)
     p.add_argument("--skip-existing", action="store_true",
                    help="If patch.txt exists for a (agent,skill) combo, skip")
-    p.add_argument("--out-summary", type=Path, default=REPO_ROOT / "results" / "rq4" / "pilot_20_summary.json")
+    p.add_argument("--out-summary", type=Path,
+                  default=REPO_ROOT / "results" / "rq4" / "pilot_20_summary.json")
     args = p.parse_args()
 
     rows = [json.loads(l) for l in args.issues.read_text().splitlines() if l.strip()]
@@ -69,9 +70,8 @@ def main() -> int:
             "--skill-mode", skill,
             "--cost-limit", str(args.cost_limit),
         ]
-        if args.skip_existing:
-            # Don't pass --no-skip-done; rely on solve.py's default skip
-            pass
+        if not args.skip_existing:
+            cmd.append("--no-skip-done")
         print(f"[start] {agent:14s} {skill:7s} {row['id']}")
         proc = subprocess.run(cmd, cwd=REPO_ROOT,
                               capture_output=True, text=True)

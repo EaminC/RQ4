@@ -53,8 +53,6 @@ def main() -> int:
                          "--no-skip-done"],
                         cwd=REPO_ROOT, capture_output=True, text=True,
                     )
-                    if proc.returncode != 0:
-                        print(f"   err: {proc.stderr[-500:]}")
                 # Record row.
                 outcome = ""
                 report_tail = ""
