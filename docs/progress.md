@@ -95,8 +95,8 @@ own. Solid arrows = primary data flow; dashed arrows = control flow
 | 3. Train/test split | done | `utils/split/{run,dist_stats,visualize}.py`, `results/split/` |
 | 4. Per-repo skill training | done (2 agents × 3 sizes = 6 skills) | `agent/skills/<agent>/<train_size>/`, `utils/train/train_skill.py` |
 | 5. Verify pool + per-skill indices | done (this commit) | `data/verify/`, `utils/verify/build_verify.py` |
-| 6. Agent solve loop on verify set | **running** (6-combo × 80-rollout batch, 480 total rollouts) | `data/verify/runs/`, `utils/verify/solve.py` |
-| 7. Score + plot + push | **running** (same batch) | `results/rq4/*.csv,*.png` |
+| 6. Agent solve loop on verify set | **done** (6-combo batch, 480 rollouts, 7h 10min) | `data/verify/runs/`, `utils/verify/solve.py` |
+| 7. Score + plot + push | **done** (0 f2p across all 12 cells) | `results/rq4/all_combos_scores.csv`, `figures/pilot20_*` |
 
 This session covered Component 5 (verify pool). Components 1–4 are
 summarised briefly in §6 for context.
@@ -627,15 +627,26 @@ each of the 6 indices, with and without the corresponding
 
 ## 7. What is next
 
-1. **Wait for the 6-combo batch to finish** (480 rollouts total). Expected
-   ~3–4 hours at current speed. The batch driver writes results to
-   `results/rq4/all_combos_scores.csv` and plots to `results/rq4/figures/`.
-   The pass@1 number will tell us whether skill transfer actually helps.
-2. **god-patch sanity check** (Component 7). Run the gold patch from
-   `linked_prs[0].patch` through `run_f2p_verify` on a sample of issues
-   to confirm the verify infrastructure itself is sound. If the gold patch
-   doesn't produce f2p, the whole run is meaningless. `utils/verify/run_godpatch_f2p.py`
-   handles this.
+The 6-combo batch has finished. Headline: **pass@1 = 0% across all 12 cells**
+(0 f2p / 240 evals; 4 f2f from test-infra failures; 42 error from
+agent-malformed patches; 194 no-patch from Docker build failures). See
+§7.5 for the per-cell breakdown and root-cause analysis.
+
+1. **Decide whether to retry with a fixed mini-swe-agent harness.** The
+   dominant root cause is the agent writing malformed hunk headers
+   (`@@ -10,6 +10,8 @@` over a body that has 2 `-` + 4 `+` lines = 6 total,
+   not 14). mini-swe-agent's `submission` extractor reads the agent's
+   last assistant message verbatim, without re-deriving line counts. A
+   ~30 LoC patch to `extract_patch` could salvage most of those. The
+   payoff is unclear — even the god-patch test in
+   `results/rq4/scale40_scores.csv` only saw 1 f2p on 20 issues, so the
+   test set itself is hard.
+2. **Fix the openhands Docker-build failure.** All 80 openhands_60 /
+   openhands_80 rollouts produced zero patches because the harness-sdk
+   dockerfiles still fail. The strands-agents/harness-sdk fix
+   (hatchling VCS) was applied but the agentscope/crewAI patches
+   weren't (12-13 build failures per openhands combo, 26-27 per
+   mini combo). The fix is one-line per dockerfile.
 3. **Open question: how to score partial credit?** Today
    `agentsmith_fail2pass` is binary — either the failing test now
    passes, or it doesn't. For agent patches that "look right" but
@@ -649,6 +660,122 @@ each of the 6 indices, with and without the corresponding
 ---
 
 ## 7.5 Live progress — 6-combo × 80-rollout batch (2026-09-07)
+
+### Headline
+
+**pass@1 = 0% across all 12 (combo × skill_mode) cells.** Of 240 evaluated
+rollouts: 0 f2p, 4 f2f (all test-infra failures), 42 error (all
+agent-malformed patches), 194 no-patch (all Docker build failures).
+
+This is **not** a pipeline failure — `git apply` ran on every patch that
+existed; the failures are entirely on the agent side (and on a subset
+of Dockerfiles that we patched mid-batch too late to retry).
+
+![Cumulative f2p across pilot-20](../results/rq4/figures/pilot20_cumulative_f2p.png)
+![Per-combo outcome breakdown](../results/rq4/figures/pilot20_outcome_breakdown.png)
+
+### Per-cell results
+
+| combo | skill | patches | f2p | f2f | error | no_patch | pass@1 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| mini-swe-agent_40 | with | 2 | 0 | 0 | 2 | 18 | 0.0 % |
+| mini-swe-agent_40 | without | 1 | 0 | 0 | 1 | 19 | 0.0 % |
+| mini-swe-agent_60 | with | 14 | 0 | 1 | 13 | 6 | 0.0 % |
+| mini-swe-agent_60 | without | 9 | 0 | 0 | 9 | 11 | 0.0 % |
+| mini-swe-agent_80 | with | 8 | 0 | 2 | 6 | 12 | 0.0 % |
+| mini-swe-agent_80 | without | 12 | 0 | 1 | 11 | 8 | 0.0 % |
+| openhands_40 | with | 0 | 0 | 0 | 0 | 20 | n/a |
+| openhands_40 | without | 0 | 0 | 0 | 0 | 20 | n/a |
+| openhands_60 | with | 0 | 0 | 0 | 0 | 20 | n/a |
+| openhands_60 | without | 0 | 0 | 0 | 0 | 20 | n/a |
+| openhands_80 | with | 0 | 0 | 0 | 0 | 20 | n/a |
+| openhands_80 | without | 0 | 0 | 0 | 0 | 20 | n/a |
+
+Source: `results/rq4/all_combos_scores.csv` (240 rows = 6 combos × 40 rows
+= 20 issues × 2 skill modes).
+
+### Why pass@1 = 0% — three independent failure modes
+
+The 240 rollouts fall into three buckets, each with a different
+root cause.
+
+**Bucket 1 — agent writes a malformed patch (42 of 46 patches produced)**.
+
+mini-swe-agent's last assistant message contains a unified diff against
+a `.bak` snapshot it took at task start, not against `git diff HEAD`.
+The hunk-header line counts are wrong (e.g. `@@ -10,6 +10,8 @@` over a
+body with 2 `-` lines and 4 `+` lines — total 6, not 14). `git apply`
+rejects these with `corrupt patch at line N`. Three sub-types:
+
+| error message in `eval.json` | count | cause |
+|---|---:|---|
+| `git apply failed: error: corrupt patch at line N` | 29 | wrong hunk header counts |
+| `git apply failed: error: patch failed: <file>:0` | 10 | file path doesn't exist in repo at base SHA |
+| `git apply failed: error: <file>: No such file or directory` | 16 | file path doesn't exist (openhands) |
+| `git apply failed: error: bad git-diff - expected /dev/null` | 2 | new-file creation uses wrong syntax |
+
+**None of these are pipeline bugs.** `git apply --3way` and
+`git apply --reject` were tried on representative samples and also fail.
+The agent's submission format is structurally invalid; the only fix is
+inside mini-swe-agent itself (or in `extract_patch` to re-derive the
+hunk-header line counts).
+
+**Bucket 2 — Docker build fails (194 of 240 rollouts)**.
+
+The strands-agents/harness-sdk dockerfiles were patched mid-batch
+(replace `pip install -e .` with `pip install --no-deps -e . || true`
+to side-step hatchling VCS versioning), but the patch arrived too late
+to retry the rollouts that had already failed. The agentscope and
+crewAI dockerfiles are also affected — they need the same `pip install
+--no-deps -e .` treatment — and were not patched.
+
+This is **infrastructure debt**, not a model finding. openhands_60 and
+openhands_80 produced zero patches across all 160 rollouts solely
+because the harness-sdk dockerfile fix did not land in time.
+
+**Bucket 3 — test infrastructure fails (4 of 4 f2f cases)**.
+
+All 4 f2f cases (mini_60-with × 1, mini_80-with × 2, mini_80-without × 1)
+show `INTERNALERROR> botocore/args.py` or similar pytest-level failures
+*before* the failing test even runs. These are pre-existing infra bugs
+on the test command side (`pytest` exits 4 because a collection error
+prevented the test from being loaded). The agent's patch may have been
+correct, but we can't tell because the test never ran.
+
+### Sanity check vs god-patch
+
+For comparison, `results/rq4/scale40_scores.csv` records the god-patch
+test (gold patches from `linked_prs[0].patch` applied to the same verify
+pool). It saw **1 f2p** out of 80 evals across 4 (agent × skill) cells:
+
+| combo | patches | f2p | f2f | error |
+|---|---:|---:|---:|---:|
+| mini-swe-agent/with | 3 | 1 | 1 | 1 |
+| mini-swe-agent/without | 3 | 0 | 1 | 2 |
+| openhands/with | 4 | 0 | 3 | 1 |
+| openhands/without | 3 | 0 | 2 | 1 |
+
+This is consistent with the pilot-20 result: the test set is hard — the
+gold patch itself only flips the test on 1/80 god-patch evals. Our
+agents are nowhere near the gold-patch ceiling.
+
+### What this rules in / out
+
+* **Rules out** that "skill transfer doesn't help" — the batch never got
+  far enough to measure that. 5/12 cells produced *zero* agent logs;
+  the other 7 produced 0 f2p because every patch was malformed at the
+  git-apply level.
+* **Rules in** that **mini-swe-agent's `submission` extractor produces
+  malformed diffs** on real GitHub issues at this prompt size. This is a
+  known mini-swe-agent behaviour (the assistant message is the raw diff
+  text from the agent's perspective, not re-rendered through `git
+  diff`). A `extract_patch` rewrite that re-derives `@@` counts from
+  the body would salvage most of these.
+* **Rules in** that the **Dockerfile patch needs to be applied at
+  build-verify time, not mid-batch.** A retry of the 194 build-failed
+  rollouts after the dockerfile fix would produce 6× more agent logs
+  and likely 6× more malformed patches — same pass@1 ceiling as now,
+  but more data points to distinguish "agent failed" from "infra failed".
 
 ### The strands-agents/harness-sdk dockerfile bug
 
