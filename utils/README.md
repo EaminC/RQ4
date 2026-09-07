@@ -92,14 +92,23 @@ python utils/verify/build_verify.py
 
 ## Verify pool design
 
-The pool (`data/verify/_pool/<issue-id>/`) is a one-shot, *patch-stripped*
-copy of every raw issue directory. To prevent the agent from cheating
-by reading the gold solution:
+The pool (`data/verify/_pool/<owner>__<name>__<issue-id>/`) is a
+one-shot, *patch-stripped* copy of every raw issue directory. The
+repo-prefixed dir naming is deliberate: GitHub issue numbers are
+repo-scoped, and the same number in two different repos refers to
+two different bugs. The earlier id-only scheme
+(`_pool/<issue-id>/`) silently overwrote content for the 8
+colliding ids, so 16 index rows pointed at the wrong pool content.
+The repo prefix and a global `pool_dir_uniqueness` audit check
+make any regression loud.
+
+To prevent the agent from cheating by reading the gold solution:
 
 - `issue_<NNN>.json` → metadata only. The keys `linked_prs[].patch`,
   `linked_prs[].base_sha`, and `linked_prs[].head_sha` are removed.
   Public PR metadata (number, state, title, url, merged, base_branch)
-  is preserved.
+  is preserved. `repo` and `id` are re-stamped so each dir is
+  self-describing.
 - `generated_patch.diff` → never copied.
 - `run.log` (the agent's stdout, contains the agent's attempted
   patch diffs) → copied only if it has no `diff --git` header;
@@ -117,7 +126,7 @@ have one row per issue with:
   "id": "issue-1077",
   "repo": "strands-agents/harness-sdk",
   "category": "B",
-  "verify_dir": "data/verify/_pool/issue-1077",
+  "verify_dir": "data/verify/_pool/strands-agents__harness-sdk__issue-1077",
   "test_relpath": "tests/agentsmith_fail2pass_1077.py",
   "f2p_status": true,
   "source_split": {"agent": "openhands", "train_size_requested": 40,
@@ -151,3 +160,34 @@ small datasets:
    `test_repo_leakage_pct` so you can see how much overlap remains.
 
 The split is deterministic given `--seed`.
+
+## `utils/verify/solve.py` — solver
+
+Drives the agent over every `split=1` row of an index file, with
+or without the matching `SKILL.md` injected into the prompt.
+
+```bash
+# Sanity-check the prompt assembly + verify-dir resolution for one
+# issue, no LLM cost, no docker.
+python utils/verify/solve.py dry-run \
+    --index data/verify/issue_index_mini-swe-agent_40.jsonl \
+    --pilot-id issue-1077 \
+    --skill-mode all
+
+# Real evaluation (requires upstream repo clones under $AGENTSMITH_ROOT):
+python utils/verify/solve.py run \
+    --index data/verify/issue_index_mini-swe-agent_40.jsonl \
+    --pilot-id issue-1077 \
+    --skill-mode all
+
+# After runs land, score them (apply patch → test → pass/fail):
+python utils/verify/solve.py score \
+    --index data/verify/issue_index_mini-swe-agent_40.jsonl \
+    --pilot-id issue-1077
+```
+
+The pilot prints a one-screen summary per `(row, skill_mode)` pair
+with prompt size, pool files, base SHA, and the resolved SKILL.md.
+The full design (modes, output layout, blocker list) is in
+`docs/handoff.md` §4.1.
+

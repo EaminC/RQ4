@@ -18,6 +18,20 @@ agent/mini-swe-agent/
 *.swp
 *.swo
 .idea/
+
+# Local artifacts we don't want to track.
+# Per-rollout trajectories are large (up to ~1 MB each) and reproducible
+# from utils/verify/solve.py; only the aggregate CSV + figures go to git.
+data/verify/runs/**/trajectory.json
+data/verify/runs/**/prompt.txt
+data/verify/runs/**/_no_patch.json
+data/verify/runs/**/_build_failed.json
+data/verify/runs/**/_timeout.json
+
+# Local-only sandbox output that may end up at the repo root
+/testbed/
+/patch.txt
+/results/eval/
 .vscode/
 __pycache__/
 *.pycutils/.env

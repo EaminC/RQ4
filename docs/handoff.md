@@ -1,4 +1,4 @@
-# Handoff — Component 6 (Solve Loop on Verify Set)
+# Handoff — Component 6/7 (Rollout + f2p Judge)
 
 *Authored 2026-09-06 by the previous agent. If you are reading this
 without the rest of the conversation, start here.*
@@ -7,12 +7,52 @@ without the rest of the conversation, start here.*
 
 The previous session built the **evaluation harness** for RQ4. The
 verify pool and 6 per-skill index files already exist on disk. Your
-job is to **drive each agent against the test issues** in every index,
-recording pass/fail, and produce the per-skill / per-category metrics
-the paper needs.
+job is to **drive each agent against the test issues** in every index
+(Component 6: rollout) and **score each rollout's patch with the f2p
+judge** (Component 7). Both are now wired and end-to-end verified on a
+single pilot.
 
-Nothing is wired to a runtime yet — this is the first script we need
-to write.
+## Pilot end-to-end (validated 2026-09-06)
+
+Issue **`issue-1058`** (agentscope-ai/agentscope, base SHA
+`f44b10fc`), both skill modes of **`mini-swe-agent_40`**:
+
+| step                 | with-skill | without-skill |
+|----------------------|-----------:|--------------:|
+| docker build         | 80 s       | (cached)      |
+| agent run            | 6m         | 3m32s         |
+| patch size           | 19 071 B   | 1 599 B       |
+| f2p outcome          | **f2f**    | **f2f**       |
+| pre-patch rc         | 2          | 2             |
+| post-patch rc        | 2          | 2             |
+| why f2f              | env missing `mcp.client.streamable_http.streamablehttp_client` at base SHA — test infra broken | agent's patch had unmatched `)` in `_openai_model.py:461` — patch introduced syntax error |
+
+Both classifications are *correct* — the judge caught two distinct
+breakage classes (env-level and patch-level) that **any** agent would
+trip on for this issue. The judge itself works.
+
+### Bug history (fixed during the pilot)
+
+1. `solve.py` default model was `tuzi-gpt-4.1-mini/...`; litellm needs
+   `openai/gpt-4.1-mini` (with `OPENAI_API_BASE` set to the tu-zi
+   gateway).
+2. `extract_patch` only looked for `diff --git` headers; mini's
+   submission is `--- file.bak / +++ file` format. Added
+   `_submission_to_git_diff()` to rewrite.
+3. `image_meta.json` was keyed per-skill-mode, causing without-skill
+   to think the image was cached (when only with-skill's image
+   existed). Fixed: shared `image_meta.json` per `(key, id)`, single
+   image-tag regardless of skill mode (the image is the repo + f2p
+   test; the skill only changes the prompt).
+4. `score.py` injection only swapped `patch` in the tmp issue JSON;
+   `run_f2p_verify()` re-reads `ctx.base_sha` from there, which was
+   `None` for our pool. Now we also inject `base_sha` (resolved from
+   `ctx.base_sha or row.base_sha`).
+5. `score.py` also hit `reset_repo_to_base(sha=None)` because the
+   wrong `ctx.base_sha` was being passed. Resolved by item 4 + using
+   `effective_base_sha` consistently.
+6. `agentscope-ai/agentscope` is a shallow clone locally — needed
+   `git fetch --unshallow` before the base SHA resolves.
 
 ---
 
@@ -26,13 +66,20 @@ to write.
   ```
   Each contains `SKILL.md`, `fallback_generic_fix.md`, `manifest.json`,
   and `repos/<owner>__<name>.md`.
-- Verify pool (`data/verify/_pool/<issue-id>/`, gitignored) — 192
-  unique dirs, **~4.6 MB**, all patch fields stripped, **exactly 3
-  files per directory** (`env.dockerfile`, the
-  `agentsmith_fail2pass_<NNN>.py` test, and the rewritten
-  `issue.json`). Built and audited by
-  `utils/verify/build_verify.py --force-pool --audit` using the
-  default `--strict` 3-file mode. The legacy 7-file mode is still
+- Verify pool (`data/verify/_pool/<repo-owner>__<repo-name>__<issue-id>/`,
+  gitignored) — **200 dirs** (one per ``(repo, id)`` row in the index).
+  The repo-prefixed dir naming is deliberate: GitHub issue numbers are
+  repo-scoped, and the same number in two different repos refers to
+  completely different bugs. The earlier scheme (``<issue-id>/``)
+  silently overwrote content for 8 colliding ids (e.g. ``issue-563``
+  in `AntonOsika/gpt-engineer` vs `dapr/dapr-agents`). The fix landed
+  in `utils/verify/build_verify.py::pool_dir_for`. Each dir is
+  **~24 KB**, total ~4.8 MB, all patch fields stripped, exactly 3
+  files per directory (`env.dockerfile`, the
+  `agentsmith_fail2pass_<NNN>.py` test, and `issue.json` — which now
+  also carries `repo` and `id` for self-description). Built and
+  audited by `utils/verify/build_verify.py --force-pool --audit` using
+  the default `--strict` 3-file mode. The legacy 7-file mode is still
   reachable via `--no-strict` for forensic debug only.
 - 6 per-skill indices (`data/verify/issue_index_<agent>_<train_size>.jsonl`,
   gitignored) — 200 rows each, `split=0` (train) / `split=1` (test).
@@ -51,18 +98,26 @@ to write.
 ### What's next (the actual ask)
 **Component 6** — `utils/verify/solve.py`. For each of the 6 per-skill
 indices, iterate every `split=1` row, point the agent at
-`data/verify/_pool/<id>/`, inject the matching
+`data/verify/_pool/<owner>__<name>__<id>/`, inject the matching
 `agent/skills/<agent>/<train_size>/SKILL.md` into the system prompt,
 and record pass/fail against `agentsmith_fail2pass_<NNN>.py`. Also
 run a *no-skill* baseline (same issue, same agent, SKILL.md removed)
 so we can report per-skill lift.
 
 ### Key invariants
-- 6 indices span **200 unique (repo, id) pairs**. Total unique issues
-  is **192** because 8 ids collide across repos (e.g. `issue-563`,
-  `issue-974` appear in two repos each). The pool shares one stripped
-  dir per id, so the pool only has 192 entries — but the index still
-  has 200 rows keyed by `(repo, id)`.
+- 6 indices span **200 unique (repo, id) pairs** — exactly the size of
+  `data/index.jsonl`. The pool has **200 dirs** (one per row), not 192,
+  because each verify dir is prefixed by `__`-joined `owner/name`:
+  ```
+  data/verify/_pool/strands-agents__sdk-python__issue-1077/
+  data/verify/_pool/AntonOsika__gpt-engineer__issue-563/
+  data/verify/_pool/dapr__dapr-agents__issue-563/             # same id,
+                                                                # different
+                                                                # repo
+  ```
+  The repo prefix prevents the **same-id-across-repos overwrite bug**
+  that hit the previous (id-only) scheme — see §4 below for the
+  post-mortem.
 - All 6 indices have **identical issue-level train/test partition**
   (`seed=42`, `mode=repo_disjoint`). Only the **count** differs:
   | skill | train | test |
@@ -73,13 +128,17 @@ so we can report per-skill lift.
   Repo leakage is **0%** for all 6.
 - The verify pool's job is to make sure the agent **cannot read the
   gold patch**. The leak audit (`data/verify/audit.json`) currently
-  reports `192/192 issues clean`. Every entry passes:
+  reports `200/200 issues clean` plus a global
+  `pool_dir_uniqueness` check. Every entry passes:
   - `absent:generated_patch.diff` — the gold diff file never copied;
   - `issue_json_no_patch_keys` — `linked_prs[].{patch, base_sha,
     head_sha}` all stripped;
   - `strict_3_file_invariant` — every verify dir contains exactly
     `env.dockerfile`, `issue.json`, and one
     `agentsmith_fail2pass_<NNN>.py`. Nothing else.
+  - `pool_dir_uniqueness` — every pool dir's
+    `issue.json.{repo, id}` matches the ``(repo, id)`` row in
+    `data/index.jsonl`, and no two pool dirs collide.
 
 ---
 
@@ -87,17 +146,70 @@ so we can report per-skill lift.
 
 | Path | What it is |
 |---|---|
-| `data/verify/_pool/<id>/` | patch-stripped issue dir (input) |
-| `data/verify/issue_index_<agent>_<train_size>.jsonl` | which issues to solve + their pool path |
+| `data/verify/_pool/<owner>__<name>__<id>/` | patch-stripped issue dir (input) |
+| `data/verify/issue_index_<agent>_<train_size>.jsonl` | which issues to solve + their pool path (now also carries `base_sha`) |
 | `agent/skills/<agent>/<train_size>/SKILL.md` | per-skill system-prompt injection |
 | `agent/run_mini.sh` | wrapper for mini-swe-agent (component 1) |
 | `agent/run_openhands.sh` | wrapper for openhands (component 2) |
 | `agent/config/mini.yaml` | mini-swe-agent config (LLM endpoint, etc.) |
 | `utils/verify/build_verify.py` | reference for reading index rows, pool layout, and the strict 3-file invariant |
 | `utils/train/train_skill.py` | reference for how SKILL.md gets injected |
-| `docs/progress.md` §6.4, §7, §8 | status, next, and reproduce |
+| `utils/verify/solve.py` | Component 6 driver (see §4.1) |
+| `docs/progress.md` §6.4, §6.5, §7, §8 | status, next, and reproduce |
 
 ---
+
+## 4.1 Component 6 — solver (this commit, scaffolding only)
+
+`utils/verify/solve.py` is the driver for Component 6. It has three
+sub-commands:
+
+| Sub-command | What it does |
+|---|---|
+| `solve.py dry-run --index <file> [--pilot-id issue-NNN] [--skill-mode with\|without\|all]` | Walks the index, resolves SKILL.md (or fallback), builds the prompt, **prints every input** without calling LLM or docker. Used to verify the data flow. |
+| `solve.py run --index <file> [...]` | **Builds a docker image per row + invokes `mini` against it.** Wired (the helpers `build_image_for_row`, `run_mini_in_docker`, `build_prompt` are complete) but the `run` branch is a stub in this commit — it does call `build_image_for_row`, but the rest of the orchestration needs `~/AgentBug-Smith/data/<owner>_<name>/` clones at every row's `base_sha` in place before the pilot will work end-to-end. See `data/verify/runs/<agent>_<train_size>/<repo>__<id>/<with\|without_skill>/` for the planned output layout. |
+| `solve.py score --index <file> [...]` | Apply each captured trajectory's patch to a fresh container, run the f2p test, record `passed`. **Not yet implemented** in this commit. |
+
+The dry-run path on **issue-1077** (the canonical example) reports
+prompt sizes of:
+
+| Skill mode | Prompt chars | First 80 chars |
+|---|---:|---|
+| with-skill   | 9 805 | `<skill>\n---\nname: rq4-issue-fixer…` |
+| no-skill     | 6 827 | `You are a software engineer. A GitHub issue from…` |
+
+The ~3 000-char delta is the SKILL.md body that the no-skill baseline
+replaces with `fallback_generic_fix.md` (1815 chars).
+
+### To actually run Component 6 (next steps)
+
+The pilot's blocker list, in order:
+
+1. **Repo clones.** Each row carries a `base_sha`. The solver expects
+   the upstream repo at `$AGENTSMITH_ROOT/<owner>_<name>/` (default
+   `~/AgentBug-Smith/data/<owner>_<name>/`). For the canonical pilot
+   issue, this is `~/AgentBug-Smith/data/strands-agents_harness-sdk/`.
+   Without the 11 cloned repos, `build_image_for_row` aborts with a
+   clear "repo clone not found" error.
+2. **Pilot one issue end-to-end.** Run:
+   ```bash
+   python utils/verify/solve.py run \
+       --index data/verify/issue_index_mini-swe-agent_40.jsonl \
+       --pilot-id issue-1077 --skill-mode all
+   ```
+   Confirm the trajectory lands in
+   `data/verify/runs/mini-swe-agent_40/strands-agents__harness-sdk__issue-1077/{with_skill,without_skill}/trajectory.json`.
+3. **Implement `solve.py score`.** Apply the trajectory's final
+   `patch.txt` to a fresh container, run
+   `pytest tests/agentsmith_fail2pass_<NNN>.py -x`, record
+   pass/fail. Run twice per (row, skill_mode): once for
+   with-skill, once for no-skill. The pair is the unit of analysis.
+4. **Scale.** Once one issue passes end-to-end, switch from
+   `--pilot-id` to the default (every `split=1` row). Expect ~6 × 153
+   with-skill + ~6 × 153 no-skill = ~1 836 runs. Set a
+   `--cost-limit` and a per-row wall-clock cap; budget ~60 h
+   wall-clock for the full sweep.
+
 
 ## 3. Suggested design for `utils/verify/solve.py`
 
@@ -184,8 +296,8 @@ Key questions you need to answer before coding:
    file is named after the issue number — `issue_9.json`, not
    `issue.json`. `build_verify.py` normalises to `issue.json` in
    the pool, so your solver will find it under that name in
-   `data/verify/_pool/<id>/`. Don't get confused by the raw dir
-   naming.
+   `data/verify/_pool/<owner>__<name>__<id>/`. Don't get confused
+   by the raw dir naming.
 3. **The pool has exactly 3 files per dir under `--strict`.** No
    `run.log`, no `summary.json`, no `f2p.txt`, no `dockerbuild.txt`,
    no `agentsmith_stat.json`. If you re-run without `--strict`
@@ -205,12 +317,24 @@ Key questions you need to answer before coding:
    because `utils/__init__.py` does not exist (intentionally — utils
    is a flat package imported via `sys.path.insert`). Same will apply
    to your new `solve.py`.
+6. **Same-id-across-repos overwrite (post-mortem).** GitHub issue
+   numbers are repo-scoped: `issue-563` in `AntonOsika/gpt-engineer`
+   is a totally different bug from `issue-563` in `dapr/dapr-agents`.
+   The old pool scheme keyed verify dirs by `<id>` only, so the
+   second occurrence silently overwrote the first — meaning half
+   the colliding rows pointed at content from the *other* repo.
+   The fix is `pool_dir_for(row)` (defined in `build_verify.py`):
+   pool dirs are now `data/verify/_pool/<owner>__<name>__<id>/`,
+   and `issue.json` carries `repo` + `id` so collisions can no
+   longer hide. The audit catches any regression under the
+   `pool_dir_uniqueness` check — never bypass it.
 
 ---
 
 ## 5. Sanity checks before you ship Component 6
 
-- `python utils/verify/build_verify.py --audit` → `192/192 issues clean`.
+- `python utils/verify/build_verify.py --audit` → `200/200 issues clean`
+  plus a global `pool_dir_uniqueness` check that also passes.
 - All 6 indices pass:
   ```python
   import json
@@ -231,12 +355,15 @@ Key questions you need to answer before coding:
       assert not viol, f"{sz_from}->{sz_to}: {len(viol)} monotonicity violations"
   print("OK")
   ```
-- `du -sh data/verify/_pool/` reports ~4.6 MB. If it grows past
+- `du -sh data/verify/_pool/` reports ~4.8 MB. If it grows past
   ~6 MB, `--force-pool` was run without `--strict` and the
   `summary.json` / `run.log` filtering regressed — re-run with the
-  default `--strict`.
+  default `--strict`. If it's still ~4.6 MB, the pool was built
+  with the **old** id-only scheme (`POOL_DIR / <id>`) — rebuild
+  with `--force-pool` to pick up the new `pool_dir_for` scheme.
 - `data/verify/audit.json` should still have every entry marked
-  `ok: true`, including the new `strict_3_file_invariant` check.
+  `ok: true`, including the `strict_3_file_invariant` check **and**
+  the `_GLOBAL_.pool_dir_uniqueness` check.
 
 ---
 
@@ -273,8 +400,8 @@ python utils/verify/build_verify.py --audit
 head -1 data/verify/issue_index_openhands_40.jsonl | python3 -m json.tool
 
 # Inspect what an agent will see
-ls data/verify/_pool/issue-1077/
-cat data/verify/_pool/issue-1077/issue.json
+ls data/verify/_pool/strands-agents__sdk-python__issue-1077/
+cat data/verify/_pool/strands-agents__sdk-python__issue-1077/issue.json
 
 # See the SKILL.md the agent will be given
 cat agent/skills/openhands/40/SKILL.md | head -40
@@ -282,6 +409,67 @@ cat agent/skills/openhands/40/SKILL.md | head -40
 # Re-run the train pipeline if a skill looks wrong
 FORCE=1 bash utils/train/run_all.sh
 ```
+
+---
+
+## 7. New section — Component 6 (rollout) + Component 7 (f2p judge)
+
+Added during the next session (2026-09-06). See TL;DR above and the
+"How to run" sections below.
+
+### Rollout (Component 6)
+
+```bash
+python utils/verify/solve.py status \
+    --index data/verify/issue_index_mini-swe-agent_40.jsonl
+
+python utils/verify/solve.py rollout \
+    --index data/verify/issue_index_mini-swe-agent_40.jsonl \
+    --pilot-id issue-1058 --skill-mode with
+
+# Full rollout (idempotent, skipped-done by default)
+python utils/verify/solve.py rollout \
+    --index data/verify/issue_index_mini-swe-agent_40.jsonl
+```
+
+### f2p judge (Component 7)
+
+```bash
+python utils/verify/score.py score \
+    --index data/verify/issue_index_mini-swe-agent_40.jsonl \
+    --pilot-id issue-1058
+
+python utils/verify/score.py summary \
+    --index data/verify/issue_index_mini-swe-agent_40.jsonl
+
+python utils/verify/score.py inspect \
+    --index data/verify/issue_index_mini-swe-agent_40.jsonl \
+    --pilot-id issue-1058
+```
+
+### Output layout
+
+```
+data/verify/runs/<agent>_<train_size>/<owner>__<repo>__<id>/
+    image_meta.json
+    with_skill/{prompt.txt,trajectory.json,patch.txt,agent.json,eval.json,eval_report.txt}
+    without_skill/{...}
+```
+
+### Known limitations
+
+- Repo clones need `git fetch --unshallow` before base SHAs resolve.
+- Pool `issue.json` lacks `linked_prs[].base_sha` and `linked_prs[].patch`;
+  `score.py` injects the agent's patch + falls back to `row.base_sha`.
+- Some issues will score f2f due to environment drift (mcp version,
+  etc.), not agent failure.
+
+### Outstanding work
+
+1. Full rollout (1 444 runs) — staged via `--max-rows` in tmux.
+2. Pre-flight `git fetch --unshallow` for all 11 upstream clones.
+3. `score.py score` on all 6 indices.
+4. Aggregate pass@1 by (agent × train_size × skill_mode).
 
 ---
 

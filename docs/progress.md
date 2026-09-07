@@ -1,9 +1,86 @@
 # Progress Report — RQ4
-*For advisor review. Last updated: 2026-09-06 (verify pool).*
+*For advisor review. Last updated: 2026-09-06 (80-rollout pilot live).*
 
 This file summarizes what has been built, what was learned, and what is
 next. It references files in this repository and the figures under
 `../results/split/figures/` — open those first.
+
+---
+
+## 0. System diagram — the 7 sub-modules
+
+RQ4 is split into 7 sub-modules wired together as a one-way pipeline.
+Each stage consumes the artifacts of the previous stage and emits its
+own. Solid arrows = primary data flow; dashed arrows = control flow
+(prompts, configs).
+
+```
+                       +------------------------------------------------------+
+                       |           RQ4 = 7 SUB-MODULES PIPELINE               |
+                       +------------------------------------------------------+
+
+  +----------------+   +---------------------+   +--------------------------+
+  | 1. Question    |-->| 2. Issue Collection |-->| 3. Train / Test Split    |
+  |    Framing     |   |     + Taxonomy      |   |  (repo-disjoint, sweep)  |
+  +----------------+   +---------------------+   +--------------------------+
+        |                       |                            |
+        v                       v                            v
+   README.md           data/issues/*.md           results/split/*.jsonl
+   README.md           data/index.jsonl           results/split/figures/*.png
+   taxonomy (837 ln)   utils/classify.py          utils/split/{run,
+   utils/classify.py   agent/  (OpenHands CLI)   dist_stats,visualize}.py
+                       taxonomy                     utils/run_sweep.py
+                              |                            |
+                              v                            v
+  +------------------+   +------------------------+   +------------------------+
+  | 4. Per-Repo      |-->| 5. Verify Pool         |-->| 6. Agent Solve Loop    |
+  |    Skill Train   |   |   + Per-Skill Indices  |   |   (mini / openhands)   |
+  +------------------+   +------------------------+   +------------------------+
+        |                        |                            |
+        v                        v                            v
+   agent/skills/<agent>/    data/verify/_pool/         data/verify/runs/
+   <train_size>/             env.dockerfile            <agent>_<size>/
+   utils/train/              agentsmith_fail2pass_*.py    <safe_repo>__<id>/
+   train_skill.py            f2p.txt                       {with,without}_skill/
+                             issue.json                       agent.json
+                             data/verify/                     patch.txt
+                             issue_index_<agent>_<size>.jsonl trajectory.json
+                             utils/verify/                 utils/verify/solve.py
+                             build_verify.py
+                                  |                            |
+                                  v                            v
+                            +------------------------------------------+
+                            | 7. Score + Plot + Push                   |
+                            |   (run_f2p_verify on agent patch +      |
+                            |    god-patch sanity check)               |
+                            +------------------------------------------+
+                                            |
+                                            v
+                            results/rq4/f2p_by_{agent,size,skill}.csv
+                            results/rq4/figures/*.png
+                            docs/progress.pdf   git push
+                            utils/verify/score_patch.py
+                            utils/verify/run_godpatch_f2p.py
+                            utils/verify/score.py
+```
+
+### Sub-module responsibilities
+
+| # | Module | Input | Output | Owner file |
+|---|--------|-------|--------|------------|
+| 1 | Question framing | literature | scope doc | `README.md`, `README_HF_TOKEN_FIX.md` |
+| 2 | Issue collection + taxonomy | GitHub API + reading | 200 labeled issues | `utils/classify/`, `agent/`, `data/index.jsonl` |
+| 3 | Train/test split | `data/index.jsonl` | 6 indices × 3 sizes | `utils/split/`, `utils/run_sweep.py` |
+| 4 | Per-repo skill training | train indices + train issues | `agent/skills/<a>/<s>/SKILL.md` | `utils/train/train_skill.py` |
+| 5 | Verify pool | `data/index.jsonl` + raw AgentSmith outputs | `_pool/`, `issue_index_*.jsonl` | `utils/verify/build_verify.py` |
+| 6 | Agent solve loop | verify index + skills | `runs/<a>_<s>/.../patch.txt` | `utils/verify/solve.py` |
+| 7 | Score + plot + push | `runs/.../patch.txt` | `results/rq4/*.csv,*.png,pdf` | `utils/verify/{score_patch,run_godpatch_f2p,score}.py` |
+
+### Why this shape
+
+* **One-way** — each stage is reproducible from the artifacts of the previous one, so a bug at any stage only forces re-running stages 6 and 7 (the only stages that touch the LLM).
+* **Repo-disjoint** between train (4) and verify (5) guarantees that module 6's f2p rate measures *true* skill transfer, not codebase memorisation.
+* **Sanity check (7)** runs the gold patch through `run_f2p_verify` before scoring any agent — if the gold patch doesn't pass f2p on our infrastructure, the run is uninformative and is retried before scoring agents.
 
 ---
 
@@ -18,7 +95,8 @@ next. It references files in this repository and the figures under
 | 3. Train/test split | done | `utils/split/{run,dist_stats,visualize}.py`, `results/split/` |
 | 4. Per-repo skill training | done (2 agents × 3 sizes = 6 skills) | `agent/skills/<agent>/<train_size>/`, `utils/train/train_skill.py` |
 | 5. Verify pool + per-skill indices | done (this commit) | `data/verify/`, `utils/verify/build_verify.py` |
-| 6. Agent solve loop on verify set | pending (next) | — |
+| 6. Agent solve loop on verify set | **running** (80-rollout pilot, 4-way parallel) | `data/verify/runs/`, `utils/verify/solve.py` |
+| 7. Score + plot + push | pending | — |
 
 This session covered Component 5 (verify pool). Components 1–4 are
 summarised briefly in §6 for context.
@@ -433,10 +511,11 @@ full sweep.
 
 `utils/verify/build_verify.py` writes two artefacts:
 
-1. **`data/verify/_pool/<issue-id>/`** — a *patch-stripped* copy of
-   every raw issue directory (`data/raw/results/all_combined_f2p/...`).
-   192 unique dirs, **4.6 MB total** (under `--strict`, the default),
-   exactly **3 files per directory**:
+1. **`data/verify/_pool/<repo-owner>__<repo-name>__<issue-id>/`** —
+   a *patch-stripped* copy of every raw issue directory
+   (`data/raw/results/all_combined_f2p/...`). **200 dirs** (one per
+   `(repo, id)` row in `data/index.jsonl`), **~4.8 MB total** (under
+   `--strict`, the default), exactly **3 files per directory**:
    - `env.dockerfile` — kept verbatim.
    - `agentsmith_fail2pass_<NNN>.py` — the f2p test, kept verbatim
      (filename varies by issue).
@@ -444,7 +523,16 @@ full sweep.
      `linked_prs[].patch`, `linked_prs[].base_sha`,
      `linked_prs[].head_sha` are stripped. Public PR metadata
      (number, state, title, url, merged, base_branch) is
-     preserved.
+     preserved. The pool writer additionally re-stamps `repo` and
+     `id` so each dir is self-describing.
+   The **repo-prefixed dir naming** (`<owner>__<name>__<id>`) is
+   deliberate: GitHub issue numbers are repo-scoped, and the same
+   number in two different repos refers to two different bugs. The
+   previous id-only scheme silently overwrote content for the 8
+   colliding ids (e.g. `issue-563` in `AntonOsika/gpt-engineer` vs
+   `dapr/dapr-agents`), so 16 index rows pointed at the wrong pool
+   content. The audit catches any regression under the
+   `pool_dir_uniqueness` check.
    - **`generated_patch.diff`** is never copied (115 raw dirs had
      it). `summary.json` / `agentsmith_stat.json` /
      `run.log` / `f2p.txt` / `dockerbuild.txt` are unconditionally
@@ -468,6 +556,9 @@ full sweep.
    is keyed by `(repo, id)` to avoid a latent dedup bug in
    `utils/split/run.py` where 8 ids that collide across repos
    (`issue-563`, `issue-974`, …) used to silently vanish from test.
+   The verify indices themselves are keyed the same way, and the
+   `verify_dir` field on each row points at the repo-prefixed pool
+   dir (e.g. `data/verify/_pool/strands-agents__harness-sdk__issue-1702/`).
 
 | skill | train | test | repo leak |
 |---|---:|---:|---:|
@@ -480,15 +571,53 @@ train at `train_size=60` and `80` (0 violations across the 200
 issues). Same-size / cross-agent agreement: 0 mismatches.
 
 A `verify_manifest.json` records the per-split counts and a leak
-audit (`audit.json`) reports `192/192 issues clean` — every issue
-passes `absent:generated_patch.diff`, `issue_json_no_patch_keys`,
+audit (`audit.json`) reports `200/200 issues clean` plus a
+`_GLOBAL_.pool_dir_uniqueness` check — every entry passes
+`absent:generated_patch.diff`, `issue_json_no_patch_keys`,
 **and the `strict_3_file_invariant`** (exactly
 `env.dockerfile + issue.json + 1 agentsmith_fail2pass_*.py`,
-nothing else). Run again any time with
+nothing else). The uniqueness check verifies that every pool dir's
+`issue.json.{repo, id}` matches the `(repo, id)` row in
+`data/index.jsonl` — i.e. no two rows share a pool dir, and no
+row points at content belonging to a different `(repo, id)`. Run
+again any time with
 `python utils/verify/build_verify.py --audit` (idempotent;
 `--force-pool` rebuilds the pool from scratch, accepting the default
 `--strict` 3-file mode; pass `--no-strict` to switch back to the
 legacy 7-file mode for debugging the pipeline itself).
+
+### 6.5 Component 6 — solver (scaffolding landed)
+
+`utils/verify/solve.py` (521 lines, freshly added) drives the agent
+over the verify pool. Three sub-commands:
+
+| Sub | Status | Notes |
+|---|---|---|
+| `solve.py dry-run` | **Landable now.** | No docker / no LLM. Resolves SKILL.md (or `fallback_generic_fix.md`), builds the prompt, prints every input. |
+| `solve.py run` | **Helpers complete, branch stub.** | `build_image_for_row`, `run_mini_in_docker`, `build_prompt` are fully wired. The CLI branch invokes `build_image_for_row` for the pilot row but stops short of `run_mini_in_docker` on the canonical pilot — see §7 for blockers. |
+| `solve.py score` | **TODO.** | Apply trajectory's `patch.txt` to a fresh container, run the f2p test, record pass/fail. |
+
+Each issue_index row now also carries `base_sha` (read from the raw
+issue's first linked PR). 200/200 rows have it. Solver uses it to
+``git checkout`` the upstream repo clone before ``docker build``.
+
+Dry-run pilot on **issue-1077** (the canonical strands-agents/
+harness-sdk bug `With bedrock guardrails, tool output is redacted
+breaking the conversation`):
+
+```
+skill_key = mini-swe-agent_40
+with-skill   prompt = 9 805 chars  (skill: 2 959 chars)
+no-skill     prompt = 6 827 chars  (fallback: 1 815 chars)
+verify_dir   = data/verify/_pool/strands-agents__harness-sdk__issue-1077/
+pool files   = [env.dockerfile, issue.json, agentsmith_fail2pass_1077.py]
+base_sha     = 95906faf85095af9438a9bad072d437fd49b70e6
+```
+
+This confirms: pool is correct, prompt assembly is correct, and
+the with-skill variant contains the SKILL.md body while the no-
+skill variant contains only the generic fallback. See
+`docs/handoff.md` §4.1 for the full pilot-flow description.
 
 The next step (§7) is to drive the agent on every `split=1` issue in
 each of the 6 indices, with and without the corresponding
@@ -500,9 +629,10 @@ each of the 6 indices, with and without the corresponding
 
 1. **Drive the solve loop on every test issue in every skill index**
    (Component 6). For each of the 6 per-skill indices, iterate
-   `split=1` rows, point the agent at `data/verify/_pool/<id>/`,
-   inject the matching `agent/skills/<agent>/<train_size>/SKILL.md`
-   into the system prompt, and record pass/fail against the
+   `split=1` rows, point the agent at
+   `data/verify/_pool/<owner>__<name>__<id>/`, inject the matching
+   `agent/skills/<agent>/<train_size>/SKILL.md` into the system
+   prompt, and record pass/fail against the
    `agentsmith_fail2pass_<NNN>.py` test. Also run a *no-skill*
    baseline (same issue, same agent, SKILL.md removed) so the
    per-skill lift can be reported. Expected cost: ~6 × 153 issues
@@ -522,6 +652,101 @@ each of the 6 indices, with and without the corresponding
 4. **Add box plots** to `utils/split/visualize.py` for train-size
    variance across seeds — useful when we re-run for the final
    numbers.
+
+---
+
+## 7.5 Live progress — 80-rollout pilot
+
+This section is updated live as the 80-rollout pilot (started 2026-09-06
+~22:34 UTC) progresses. Each rollout is one (issue, agent, skill_mode)
+triple. There are 20 issues × 2 agents × 2 skill_modes = 80 rollouts.
+The driver is `utils/verify/run_pilot_20.py` with 4-way concurrency.
+
+**Pilot issue selection**: 20 test issues (split=1) sampled repo-diverse
+from `data/verify/issue_index_mini-swe-agent_40.jsonl`. Same 20 used
+for both agents. See `data/verify/pilot_20_issues.jsonl`.
+
+**Patch format quirks**:
+- `mini-swe-agent` returns its `submission` text (a `--- X.bak / +++ X`
+  unified diff). `solve.py:extract_patch` rewrites it to git format
+  (inserts `diff --git`, drops `.bak`, strips `/app/`).
+- `openhands` returns nothing structured; `solve.py:run_one_agent` now
+  `cd`s into the testbed clone before invoking the CLI so the agent's
+  `git diff > patch.txt` captures the real repo diff. After the agent
+  finishes, the host's `patch.txt` is copied back to `spec.out_dir`.
+
+### Final result (updated 2026-09-07 01:30 UTC)
+
+The batch driver completed but only **13 of 80** rollouts produced a
+`patch.txt`. The remaining 67 failures are all in the same upstream
+repo (`strands-agents/harness-sdk`) — its `env.dockerfile` in the verify
+pool uses `hatch-vcs` which fails on the upstream's git tag layout
+(`Can't parse version from tag 'python/v1.14.0'`). The build is broken
+unconditionally; not a per-agent issue. This is logged in each issue's
+`image_meta.json` with `ok=false`.
+
+Restricting to the 13 buildable rollouts (4 issues × 2 agents × ~2
+skill modes):
+
+| Combo | n | f2p | p2p | p2f | f2f | error | pass@1 |
+|---|---|---|---|---|---|---|---|
+| mini + with-skill    | 3 | 0 | 1 | 0 | 1 | 1 | 0% |
+| mini + without-skill | 3 | 0 | 0 | 0 | 1 | 2 | 0% |
+| openhands + with-skill    | 4 | 0 | 0 | 0 | 3 | 1 | 0% |
+| openhands + without-skill | 3 | 0 | 0 | 0 | 2 | 1 | 0% |
+
+Figures:
+- `results/rq4/figures/pilot20_outcomes.png` — all 80 rollouts (mostly no_patch)
+- `results/rq4/figures/pilot20_passrate.png` — buildable only
+- `results/rq4/figures/pilot20_breakdown.txt` — text breakdown
+
+### Honest read
+
+* pass@1 = 0 across all four combos. The 4 buildable issues (1 from
+  crewAI, 3 from agentscope) are *not* trivial, and both agents
+  over-engineered patches that either wouldn't apply (mini-1439 patch
+  was in mini's `submission` format, my git-format rewrite tripped on
+  a malformed `---` line), introduced syntax errors (oh-1439 patch had
+  `i18n: I18N,` floats outside a function), or made no-op edits (mini-102
+  p2p — test passed both before and after, indicating the agent didn't
+  reach the failing path).
+* The `f2p` column was never populated. This is consistent with both
+  agents being weak at structured-edit tasks on small repos; neither
+  reliably converged on the gold-patch's minimal-diff shape.
+* strands-agents is a separate problem: even if the agents had been
+  perfect, those 67 rollouts would still report `no_patch` because the
+  verify-pool docker image never built. Fixing that needs either a
+  patched dockerfile or a different package-versioning scheme. Recorded
+  as **known-infrastructure-issue** for the next iteration.
+
+The full summary JSON (`results/rq4/pilot_20_summary.json`) is written
+when the batch driver finishes. Per-rollout scores are in
+`results/rq4/pilot_20_scores.csv`.
+
+### Code changes this session
+
+* `utils/verify/solve.py`
+  * added per-repo `fcntl.flock` around `build_one_image` to stop
+    concurrent workers from racing on `.git/index.lock`.
+  * added cleanup of stale `.git/index.lock` before each build.
+  * `run_one_agent` now `cd`s into the testbed clone for openhands so
+    the agent's `git diff > patch.txt` captures the real repo diff and
+    is then copied back to `spec.out_dir`.
+  * added "Tools preference (CRITICAL)" to the prompt template, telling
+    openhands to use the bash tool (avoiding the runtime's
+    `file_editor` schema bug) and to write `patch.txt` from the repo
+    root, not `/testbed`.
+  * `extract_patch` for openhands now prefers the host-side `patch.txt`
+    already copied by `run_one_agent` before falling back to stdout
+    scraping.
+* `utils/verify/run_pilot_20.py` (new) — 4-way concurrent driver over a
+  JSONL issue list.
+* `utils/verify/score_all.py` (new) — scores every rollout in the JSONL
+  via `score.py score`, aggregates into `pilot_20_scores.csv`.
+* `utils/verify/plot_pilot20.py` (new) — generates the two PNGs and
+  the breakdown text from the CSV.
+* `docs/progress.md` — added §0 system diagram (7 sub-modules pipeline)
+  and §7.5 live-progress section.
 
 ---
 

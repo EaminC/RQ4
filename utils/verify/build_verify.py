@@ -25,8 +25,11 @@ verify directory contains exactly three files — all metadata, build
 logs, and agent run logs are excluded from the pool:
 
     data/verify/
-        _pool/<issue_id>/                 # one stripped copy per issue (200 total)
+        _pool/<repo_owner>__<repo_name>__<issue_id>/   # one dir per
+                                                        # (repo, id) row
+                                                        # (200 total)
             issue.json                    # patch-stripped metadata
+                                           # includes `repo` for self-doc
             agentsmith_fail2pass_<NNN>.py # the f2p test (kept verbatim)
             env.dockerfile                # docker build context
 
@@ -38,7 +41,7 @@ logs, and agent run logs are excluded from the pool:
             #   category    A..F
             #   confidence  high|medium|low
             #   raw_path    source directory under data/raw
-            #   verify_dir  data/verify/_pool/<id>  (always the same)
+            #   verify_dir  data/verify/_pool/<owner>__<name>__<id>
             #   test_relpath  tests/agentsmith_fail2pass_<NNN>.py
             #   dockerfile  env.dockerfile path
             #   f2p_status  "success" if summary.json says f2p_succeeded=true
@@ -93,6 +96,26 @@ sys.path.insert(0, str(HERE.parent))        # utils/  so `from split import run`
 ALL_COMBINED_ROOT = REPO_ROOT / "data" / "raw" / "results" / "all_combined_f2p"
 VERIFY_ROOT       = REPO_ROOT / "data" / "verify"
 POOL_DIR          = VERIFY_ROOT / "_pool"
+
+
+def pool_dir_for(row: dict[str, Any]) -> Path:
+    """Return the verify-pool directory for a single (repo, id) row.
+
+    Pool dirs are keyed by the composite ``<repo_owner>__<repo_name>__<id>``
+    so that the same GitHub issue number in two different repos maps to
+    two distinct dirs. Without the repo prefix, the second write would
+    silently overwrite the first and the index would point at the wrong
+    content. (See ``docs/progress.md`` §5 for the original incident.)
+    """
+    issue_id = row["id"]
+    repo = row.get("repo") or ""
+    if "/" in repo:
+        owner, name = repo.split("/", 1)
+        prefix = f"{owner}__{name}__"
+    else:
+        prefix = ""
+    return POOL_DIR / f"{prefix}{issue_id}"
+
 
 #: The six (agent, train_size) skills we trained on. Each one needs
 #: its own index file because (a) test_size varies with train_size and
@@ -186,6 +209,34 @@ def _find_test_file(raw_dir: Path) -> Path | None:
     return None
 
 
+def _scrape_base_sha(raw_dir: Path) -> str | None:
+    """Return the base_sha of the first linked PR for this issue.
+
+    The solver (``utils/verify/solve.py``) needs the commit hash the
+    repo should be checked out to before ``docker build`` — i.e. the
+    state of the repo *just before* the linked PR's fix landed. The
+    raw ``issue_<NNN>.json`` carries it under
+    ``linked_prs[0].base_sha``. We deliberately do *not* persist it
+    in the pool's ``issue.json`` (it's PR-flow metadata) — instead
+    we expose it on the solver's index rows only.
+    """
+    raw_issue_json = raw_dir / f"issue_{Path(raw_dir).name.split('_')[1]}.json"
+    if not raw_issue_json.exists():
+        # Fallback: any issue_<NNN>.json in the raw dir.
+        candidates = list(raw_dir.glob("issue_*.json"))
+        if not candidates:
+            return None
+        raw_issue_json = candidates[0]
+    try:
+        obj = json.loads(raw_issue_json.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    prs = obj.get("linked_prs") or []
+    if not prs:
+        return None
+    return prs[0].get("base_sha")
+
+
 def _find_issue_json(raw_dir: Path) -> Path | None:
     """Find the per-issue metadata file.
 
@@ -262,7 +313,7 @@ def _build_one_issue(row: dict[str, Any], force: bool,
         return {"id": issue_id, "ok": False, "reason": "raw_dir_missing",
                 "raw_path": str(raw_dir)}
 
-    verify_dir = POOL_DIR / issue_id
+    verify_dir = pool_dir_for(row)
     if verify_dir.exists() and not force:
         # Pool is already built for this issue — idempotent skip.
         # We still need to return the per-issue stats below, but the
@@ -297,6 +348,12 @@ def _build_one_issue(row: dict[str, Any], force: bool,
         audit["reason"] = "issue_json_missing"
         return audit
     stripped = _strip_issue_json(issue_json_raw)
+    # Re-stamp ``repo`` and ``id`` so the verify dir is self-describing
+    # even if the raw issue.json dropped them. This also makes collision
+    # dirs unambiguously attributable to the right ``(repo, id)``.
+    if row.get("repo"):
+        stripped["repo"] = row["repo"]
+    stripped["id"] = issue_id
     (verify_dir / "issue.json").write_text(
         json.dumps(stripped, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -351,7 +408,7 @@ def _audit_one_issue(row: dict[str, Any]) -> dict[str, Any]:
     """Return a lightweight per-issue entry without rewriting."""
     issue_id = row["id"]
     raw_dir = Path(row["path"])
-    verify_dir = POOL_DIR / issue_id
+    verify_dir = pool_dir_for(row)
     test_file = _find_test_file(raw_dir)
     return {
         "id": issue_id,
@@ -534,10 +591,16 @@ def build_index(agent: str, train_size: int, index_rows: list[dict[str, Any]]
                 "category": row.get("category"),
                 "confidence": row.get("confidence"),
                 "raw_path": str(raw_dir.relative_to(REPO_ROOT)),
-                "verify_dir": str((POOL_DIR / row["id"]).relative_to(REPO_ROOT)),
+                "verify_dir": str(pool_dir_for(row).relative_to(REPO_ROOT)),
                 "test_relpath": (f"tests/{test_file.name}"
                                  if test_file is not None else None),
                 "f2p_status": f2p_status,
+                # Base SHA at which the agent must start editing. Read
+                # from raw issue.json's first linked_pr (already patch-
+                # stripped by build_pool). Solver needs this to
+                # ``git checkout`` the right tree before
+                # ``docker build``.
+                "base_sha": _scrape_base_sha(raw_dir),
                 "source_split": {
                     "agent": agent,
                     "train_size_requested": train_size,
@@ -562,7 +625,9 @@ def _pool_file_set(verify_dir: Path) -> set[str]:
     return {p.name for p in verify_dir.iterdir() if p.is_file()} if verify_dir.exists() else set()
 
 
-def audit_pool(strict: bool = DEFAULT_STRICT) -> list[dict[str, Any]]:
+def audit_pool(strict: bool = DEFAULT_STRICT,
+                index_rows: list[dict[str, Any]] | None = None,
+                ) -> list[dict[str, Any]]:
     """Walk the pool and confirm no leak vector survived.
 
     Under ``strict`` mode (the default) we additionally enforce that every
@@ -574,6 +639,14 @@ def audit_pool(strict: bool = DEFAULT_STRICT) -> list[dict[str, Any]]:
 
     Anything else (``summary.json``, ``run.log``, ``generated_patch.diff``,
     …) is treated as a leak and the issue is marked ``ok=False``.
+
+    If ``index_rows`` is provided we additionally cross-check that:
+      - every pool ``issue.json`` carries a non-null ``repo`` field;
+      - the ``repo`` field matches the one declared in ``data/index.jsonl``
+        for the corresponding ``(repo, id)`` row (catches the
+        same-id-across-repos overwrite bug);
+      - every pool dir corresponds to a unique ``(repo, id)`` pair
+        (no two pool dirs collide because their repo prefix is missing).
     """
     findings: list[dict[str, Any]] = []
     if not POOL_DIR.exists():
@@ -640,6 +713,47 @@ def audit_pool(strict: bool = DEFAULT_STRICT) -> list[dict[str, Any]]:
             })
         finding["ok"] = all(c.get("ok") for c in finding["checks"])
         findings.append(finding)
+
+    # 5. Global cross-check: every pool dir should correspond to a
+    #    unique ``(repo, id)`` pair from ``index_rows``. If two pool
+    #    dirs share the same ``(repo, id)`` (or two different ids share
+    #    one dir), the build is broken.
+    if index_rows is not None:
+        expected = {pool_dir_for(r).resolve(): (r.get("repo"), r["id"])
+                    for r in index_rows}
+        actual = {p.resolve(): None for p in POOL_DIR.iterdir() if p.is_dir()}
+        # Populate actual from each dir's issue.json so we can match.
+        for pool_path in list(actual):
+            ij = pool_path / "issue.json"
+            if not ij.exists():
+                continue
+            try:
+                obj = json.loads(ij.read_text(encoding="utf-8"))
+                actual[pool_path] = (obj.get("repo"), obj.get("id"))
+            except Exception:
+                pass
+        mismatch_paths = [
+            str(p.relative_to(REPO_ROOT))
+            for p, key in actual.items()
+            if key is None or expected.get(p) != key
+        ]
+        missing = [
+            str(p.relative_to(REPO_ROOT))
+            for p, key in expected.items()
+            if p not in actual
+        ]
+        findings.append({
+            "id": "_GLOBAL_",
+            "checks": [{
+                "check": "pool_dir_uniqueness",
+                "ok": not mismatch_paths and not missing,
+                "n_expected_dirs": len(expected),
+                "n_actual_dirs": len(actual),
+                "mismatched_issue_json": mismatch_paths,
+                "missing_pool_dirs": missing,
+            }],
+            "ok": not mismatch_paths and not missing,
+        })
     return findings
 
 
@@ -739,7 +853,7 @@ def main() -> None:
     # 4. Audit (optional).
     if args.audit:
         print(f"[audit] scanning verify pool (strict={args.strict}) ...")
-        findings = audit_pool(strict=args.strict)
+        findings = audit_pool(strict=args.strict, index_rows=index_rows)
         n_ok = sum(1 for f in findings if f.get("ok"))
         n_bad = len(findings) - n_ok
         print(f"[audit] {n_ok}/{len(findings)} issues clean")
