@@ -1,5 +1,5 @@
 # Progress Report — RQ4
-*For advisor review. Last updated: 2026-09-06 (80-rollout pilot live).*
+*For advisor review. Last updated: 2026-09-07 (6-combo × 80-rollout batch live).*
 
 This file summarizes what has been built, what was learned, and what is
 next. It references files in this repository and the figures under
@@ -95,8 +95,8 @@ own. Solid arrows = primary data flow; dashed arrows = control flow
 | 3. Train/test split | done | `utils/split/{run,dist_stats,visualize}.py`, `results/split/` |
 | 4. Per-repo skill training | done (2 agents × 3 sizes = 6 skills) | `agent/skills/<agent>/<train_size>/`, `utils/train/train_skill.py` |
 | 5. Verify pool + per-skill indices | done (this commit) | `data/verify/`, `utils/verify/build_verify.py` |
-| 6. Agent solve loop on verify set | **running** (80-rollout pilot, 4-way parallel) | `data/verify/runs/`, `utils/verify/solve.py` |
-| 7. Score + plot + push | pending | — |
+| 6. Agent solve loop on verify set | **running** (6-combo × 80-rollout batch, 480 total rollouts) | `data/verify/runs/`, `utils/verify/solve.py` |
+| 7. Score + plot + push | **running** (same batch) | `results/rq4/*.csv,*.png` |
 
 This session covered Component 5 (verify pool). Components 1–4 are
 summarised briefly in §6 for context.
@@ -627,22 +627,15 @@ each of the 6 indices, with and without the corresponding
 
 ## 7. What is next
 
-1. **Drive the solve loop on every test issue in every skill index**
-   (Component 6). For each of the 6 per-skill indices, iterate
-   `split=1` rows, point the agent at
-   `data/verify/_pool/<owner>__<name>__<id>/`, inject the matching
-   `agent/skills/<agent>/<train_size>/SKILL.md` into the system
-   prompt, and record pass/fail against the
-   `agentsmith_fail2pass_<NNN>.py` test. Also run a *no-skill*
-   baseline (same issue, same agent, SKILL.md removed) so the
-   per-skill lift can be reported. Expected cost: ~6 × 153 issues
-   per skill (lowest-size split) → ~918 runs with skill + 918
-   without = ~1.8k runs.
-2. **Reduce to the LLM metrics the paper needs**: pass rate
-   per-skill, per-category (A–F), per-repo, lift from skill vs
-   baseline, and statistical confidence (95 % CI via Wilson
-   interval). Render all of this into a 1-page summary figure
-   alongside the existing `results/split/figures/`.
+1. **Wait for the 6-combo batch to finish** (480 rollouts total). Expected
+   ~3–4 hours at current speed. The batch driver writes results to
+   `results/rq4/all_combos_scores.csv` and plots to `results/rq4/figures/`.
+   The pass@1 number will tell us whether skill transfer actually helps.
+2. **god-patch sanity check** (Component 7). Run the gold patch from
+   `linked_prs[0].patch` through `run_f2p_verify` on a sample of issues
+   to confirm the verify infrastructure itself is sound. If the gold patch
+   doesn't produce f2p, the whole run is meaningless. `utils/verify/run_godpatch_f2p.py`
+   handles this.
 3. **Open question: how to score partial credit?** Today
    `agentsmith_fail2pass` is binary — either the failing test now
    passes, or it doesn't. For agent patches that "look right" but
@@ -655,73 +648,48 @@ each of the 6 indices, with and without the corresponding
 
 ---
 
-## 7.5 Live progress — 80-rollout pilot
+## 7.5 Live progress — 6-combo × 80-rollout batch (2026-09-07)
 
-This section is updated live as the 80-rollout pilot (started 2026-09-06
-~22:34 UTC) progresses. Each rollout is one (issue, agent, skill_mode)
-triple. There are 20 issues × 2 agents × 2 skill_modes = 80 rollouts.
-The driver is `utils/verify/run_pilot_20.py` with 4-way concurrency.
+### The strands-agents/harness-sdk dockerfile bug
 
-**Pilot issue selection**: 20 test issues (split=1) sampled repo-diverse
-from `data/verify/issue_index_mini-swe-agent_40.jsonl`. Same 20 used
-for both agents. See `data/verify/pilot_20_issues.jsonl`.
+The first 80-rollout pilot (2026-09-06) failed for 67/80 rollouts because
+**every strands-agents/harness-sdk issue's dockerfile used `pip install -e .`
+with hatchling's VCS version backend**. The harness-sdk repo has git tags
+like `python/v1.14.0` and `python/v1.22.0`, which don't match hatchling's
+`tag_regex='^(?:[\w-]+-)?(?P<version>[vV]?\d+(?:\.\d+){0,2}[^\+]*)(?:\+.*)?$'`
+(the `python/` prefix puts the version in the wrong position).
 
-**Patch format quirks**:
-- `mini-swe-agent` returns its `submission` text (a `--- X.bak / +++ X`
-  unified diff). `solve.py:extract_patch` rewrites it to git format
-  (inserts `diff --git`, drops `.bak`, strips `/app/`).
-- `openhands` returns nothing structured; `solve.py:run_one_agent` now
-  `cd`s into the testbed clone before invoking the CLI so the agent's
-  `git diff > patch.txt` captures the real repo diff. After the agent
-  finishes, the host's `patch.txt` is copied back to `spec.out_dir`.
+**Fix applied**: All 79 strands-agents/harness-sdk dockerfiles in the verify
+pool were patched to replace the hatchling VCS backend with a plain
+`pip install --no-deps -e . || true` (allow failure). The preflight check
+was changed from `import pkg_resources, pytest, moto` to `import pytest` (the
+former trips on pkg_resources deprecation warnings in newer setuptools).
+The 79 fixed dockerfiles cover every strands issue in the pool.
 
-### Final result (updated 2026-09-07 01:30 UTC)
+For agentscope-ai/agentscope and crewAIInc/crewAI the original dockerfiles
+worked fine — only strands uses hatchling VCS versioning.
 
-The batch driver completed but only **13 of 80** rollouts produced a
-`patch.txt`. The remaining 67 failures are all in the same upstream
-repo (`strands-agents/harness-sdk`) — its `env.dockerfile` in the verify
-pool uses `hatch-vcs` which fails on the upstream's git tag layout
-(`Can't parse version from tag 'python/v1.14.0'`). The build is broken
-unconditionally; not a per-agent issue. This is logged in each issue's
-`image_meta.json` with `ok=false`.
+### Batch design
 
-Restricting to the 13 buildable rollouts (4 issues × 2 agents × ~2
-skill modes):
+Each of the 6 (agent, scale) combos runs 20 randomly-sampled test issues
+(with seed=42) × 2 skill modes × 2 agents = 80 rollouts:
 
-| Combo | n | f2p | p2p | p2f | f2f | error | pass@1 |
-|---|---|---|---|---|---|---|---|
-| mini + with-skill    | 3 | 0 | 1 | 0 | 1 | 1 | 0% |
-| mini + without-skill | 3 | 0 | 0 | 0 | 1 | 2 | 0% |
-| openhands + with-skill    | 4 | 0 | 0 | 0 | 3 | 1 | 0% |
-| openhands + without-skill | 3 | 0 | 0 | 0 | 2 | 1 | 0% |
+| combo | n issues | repos in sample |
+|---|---|---|
+| mini-swe-agent_40 | 20 | 11 strands + 4 agentscope + 3 crewAI + 2 other |
+| mini-swe-agent_60 | 20 | 12 strands + 8 agentscope |
+| mini-swe-agent_80 | 20 | 20 strands |
+| openhands_40 | 20 | 11 strands + 5 agentscope + 4 crewAI |
+| openhands_60 | 20 | 15 strands + 5 agentscope |
+| openhands_80 | 20 | 20 strands |
 
-Figures:
-- `results/rq4/figures/pilot20_outcomes.png` — all 80 rollouts (mostly no_patch)
-- `results/rq4/figures/pilot20_passrate.png` — buildable only
-- `results/rq4/figures/pilot20_breakdown.txt` — text breakdown
+Issues are randomly sampled (seed=42) from each combo's test set
+(`split=1` in the corresponding `issue_index_<agent>_<scale>.jsonl`).
+Per-issue files are `data/verify/pilot_20_issues_<agent>_<scale>.jsonl`.
 
-### Honest read
-
-* pass@1 = 0 across all four combos. The 4 buildable issues (1 from
-  crewAI, 3 from agentscope) are *not* trivial, and both agents
-  over-engineered patches that either wouldn't apply (mini-1439 patch
-  was in mini's `submission` format, my git-format rewrite tripped on
-  a malformed `---` line), introduced syntax errors (oh-1439 patch had
-  `i18n: I18N,` floats outside a function), or made no-op edits (mini-102
-  p2p — test passed both before and after, indicating the agent didn't
-  reach the failing path).
-* The `f2p` column was never populated. This is consistent with both
-  agents being weak at structured-edit tasks on small repos; neither
-  reliably converged on the gold-patch's minimal-diff shape.
-* strands-agents is a separate problem: even if the agents had been
-  perfect, those 67 rollouts would still report `no_patch` because the
-  verify-pool docker image never built. Fixing that needs either a
-  patched dockerfile or a different package-versioning scheme. Recorded
-  as **known-infrastructure-issue** for the next iteration.
-
-The full summary JSON (`results/rq4/pilot_20_summary.json`) is written
-when the batch driver finishes. Per-rollout scores are in
-`results/rq4/pilot_20_scores.csv`.
+The driver `utils/verify/run_all_6_combos.py` runs 3 combos in parallel
+(each with 2 concurrent workers), scoring after each combo, then aggregates
+all 6 CSVs and plots. Expected total: 480 rollouts.
 
 ### Code changes this session
 
@@ -745,6 +713,8 @@ when the batch driver finishes. Per-rollout scores are in
   via `score.py score`, aggregates into `pilot_20_scores.csv`.
 * `utils/verify/plot_pilot20.py` (new) — generates the two PNGs and
   the breakdown text from the CSV.
+* `utils/verify/run_all_6_combos.py` (new) — runs 6 (agent, scale)
+  combos, aggregates, and plots.
 * `docs/progress.md` — added §0 system diagram (7 sub-modules pipeline)
   and §7.5 live-progress section.
 
@@ -783,12 +753,15 @@ python utils/verify/build_verify.py --audit    # + leak-vector scan + 3-file inv
 # forensic: rebuild the legacy 7-file pool (only for debugging the pipeline)
 python utils/verify/build_verify.py --force-pool --no-strict --audit
 
-# 7. (next) Run the solve loop on every test issue in every skill
-python utils/verify/solve.py \
-    --agent openhands --train-size 40 \
-    --index data/verify/issue_index_openhands_40.jsonl \
-    --split test \
-    --out results/verify/openhands_40.jsonl
+# 7. Run the 6-combo × 80-rollout batch (480 total)
+python utils/verify/run_all_6_combos.py        # 3 parallel combos, scores, plots
+# individual combo (for debugging):
+python utils/verify/run_pilot_20.py \
+    --issues data/verify/pilot_20_issues_mini-swe-agent_40.jsonl \
+    --train-size 40 --workers 2 --cost-limit 3.0
+
+# 8. God-patch sanity check (confirm gold patch → f2p)
+python utils/verify/run_godpatch_f2p.py --index data/verify/issue_index_mini-swe-agent_40.jsonl
 ```
 
 This produces `train.jsonl`, `test.jsonl`, `summary.json` under
