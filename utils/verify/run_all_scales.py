@@ -18,7 +18,7 @@ from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ISSUES    = REPO_ROOT / "data" / "verify" / "pilot_20_issues.jsonl"
+ISSUES    = REPO_ROOT / "data" / "verify" / "pilot_20_issues_v2.jsonl"
 SCALES    = [40, 60, 80]
 WORKERS   = 2          # concurrent rollouts per scale
 COST_LIM = 3.0
@@ -44,6 +44,7 @@ def run_scale(scale: int) -> tuple[int, str]:
         "--workers", str(WORKERS),
         "--cost-limit", str(COST_LIM),
         "--out-summary", str(summary_out),
+        "--skip-existing",
     ], cwd=REPO_ROOT).returncode
 
     elapsed = time.time() - t0
