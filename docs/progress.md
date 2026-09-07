@@ -661,13 +661,29 @@ like `python/v1.14.0` and `python/v1.22.0`, which don't match hatchling's
 
 **Fix applied**: All 79 strands-agents/harness-sdk dockerfiles in the verify
 pool were patched to replace the hatchling VCS backend with a plain
-`pip install --no-deps -e . || true` (allow failure). The preflight check
+`pip install --no-deps -e . || true` (allow failure), and add a
+`pip install hatchling hatch-vcs setuptools-scm` line. The preflight check
 was changed from `import pkg_resources, pytest, moto` to `import pytest` (the
 former trips on pkg_resources deprecation warnings in newer setuptools).
 The 79 fixed dockerfiles cover every strands issue in the pool.
 
 For agentscope-ai/agentscope and crewAIInc/crewAI the original dockerfiles
 worked fine — only strands uses hatchling VCS versioning.
+
+### The agentscope mcp version bug
+
+When the fix was verified on issue-1058, the agentscope test failed with
+`ImportError: cannot import name 'streamablehttp_client' from mcp.client.streamable_http`.
+Root cause: the dockerfile's `pip install -e .` (with no constraints) pulls
+in the latest mcp (2.1.1), but agentscope's source code imports
+`streamablehttp_client` (single-underscore lowercase), which was *removed*
+in mcp≥1.14 in favour of `streamable_http_client`.
+
+**Fix applied**: 45+ agentscope dockerfiles were patched to add
+`pip install "mcp>=1.13,<1.14"` immediately after `pip install -e .` (and
+also before, in case `pip install -e .` itself indirectly pulls a newer mcp).
+Verified the `mcp.client.streamable_http.streamablehttp_client` import
+succeeds in the rebuilt container.
 
 ### Batch design
 
@@ -690,6 +706,21 @@ Per-issue files are `data/verify/pilot_20_issues_<agent>_<scale>.jsonl`.
 The driver `utils/verify/run_all_6_combos.py` runs 3 combos in parallel
 (each with 2 concurrent workers), scoring after each combo, then aggregates
 all 6 CSVs and plots. Expected total: 480 rollouts.
+
+A subagent (`f8500c7f`) is currently driving all 6 combos in parallel
+under a long-lived terminal — see `/tmp/rq4-batch/<combo>_rollouts.log`
+for per-combo progress. ETA ~ 3-5 hours at 1.5-3 min/rollout.
+
+### Additional fixes applied this session
+
+* `git clean -fd` added to `solve.py:build_one_image` so `git checkout <base_sha>`
+  no longer fails on untracked working-tree files left by the previous docker
+  build (e.g. `src/agentscope/web/studio/__init__.py`).
+* `_strip_app_prefix` strips leading `b/` from diff-style paths (e.g.
+  `b/X` → `X`) so that mini-swe-agent submissions from `cat patch.txt`
+  can be re-applied with `git apply`.
+* `utils/__init__.py` added so `score.py` can be imported as a module
+  (was previously failing with `No module named 'utils.verify'`).
 
 ### Code changes this session
 
