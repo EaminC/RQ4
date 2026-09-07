@@ -491,6 +491,10 @@ def build_one_image(spec: RunSpec) -> tuple[bool, str]:
             ["git", "-C", str(repo_dir), "reset", "--hard", "HEAD"],
             capture_output=True, text=True, timeout=60,
         )
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "clean", "-fd"],
+            capture_output=True, text=True, timeout=60,
+        )
         rc = subprocess.run(
             ["git", "-C", str(repo_dir), "checkout", spec.row.base_sha],
             capture_output=True, text=True, timeout=60,
@@ -626,11 +630,14 @@ def run_one_agent(spec: RunSpec, prompt: str, *,
 def _strip_app_prefix(path: str) -> str:
     """Strip ``/app/`` from a path. Mini operates on the repo mounted
     at ``/app``; ``git apply`` against the host repo needs repo-relative
-    paths.
+    paths. Also strips ``b/`` from diff-style paths (``b/X → X``).
     """
     p = path.strip()
     if p.startswith("/app/"):
         p = p[len("/app/"):]
+    # Strip leading "b/" from diff-style paths (e.g. "b/A2A/wrapper.py → A2A/wrapper.py")
+    if p.startswith("b/"):
+        p = p[2:]
     return p
 
 
@@ -679,7 +686,7 @@ def _submission_to_git_diff(submission: str) -> str | None:
     """
     if not submission:
         return None
-    if "diff --git " in submission and "/app/" not in submission:
+    if "diff --git " in submission and "/app/" not in submission and " a/b/" not in submission:
         # Already in git format; nothing to do.
         return submission
 
