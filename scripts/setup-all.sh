@@ -154,6 +154,13 @@ Next steps (from $REPO_ROOT):
   source agent/.venv/bin/activate && source utils/.env
   python utils/verify/build_verify.py --audit
 
+  # 1b. Generate the pilot-30 index subsets (5 issues × 6 combos).
+  #     Reads the 6 full combo indexes just written, samples 5 ids
+  #     from mini-swe-agent_40 split=1 with seed=20260909 (matches
+  #     docs/progress.md §9), and writes 12 pilot-30 indexes (one
+  #     per combo × {with,without}-issue-1351).
+  python utils/verify/make_pilot30_index.py
+
   # 2. Train skills (if agent/skills/ is missing)
   bash utils/train/run_all.sh
 
