@@ -14,7 +14,18 @@ bootstrapped by its own setup script.
 All components route their LLM calls through a shared OpenAI-compatible
 gateway (`https://api.tu-zi.com`).
 
-## Quick start
+## Quick start (one-shot, fresh box)
+
+```bash
+git clone https://github.com/EaminC/RQ4.git && cd RQ4
+bash scripts/setup-all.sh     # runs all 3 component setup scripts
+```
+
+`setup-all.sh` checks git / python / uv / docker, ensures the daemon
+is up with ≥30 GB free, then chains `setup.sh`, `setup-openhands.sh`
+and `setup-utils.sh`. It is idempotent — re-run any time.
+
+## Quick start (per-component, if you only need one)
 
 ```bash
 # Component 1 — CLI agent
@@ -41,9 +52,13 @@ python utils/verify/build_verify.py --audit       # build verify pool
 ├── README.md                — this file
 ├── .gitignore
 ├── scripts/
-│   ├── setup.sh             — bootstrap for component 1
+│   ├── setup-all.sh          — one-shot bootstrap (use this on a fresh box)
+│   ├── setup.sh              — bootstrap for component 1
 │   ├── setup-openhands.sh   — bootstrap for component 2
-│   └── setup-utils.sh       — bootstrap for component 3
+│   └── setup-utils.sh        — bootstrap for component 3
+├── docs/
+│   ├── progress.md          — full project progress
+│   └── progress_migration.md — migration guide (2026-09-11)
 ├── agent/
 │   ├── README.md            — component-level notes
 │   ├── run_mini.sh          — wrapper for component 1

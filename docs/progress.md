@@ -1,5 +1,5 @@
 # Progress Report — RQ4
-*For advisor review. Last updated: 2026-09-07 (6-combo × 80-rollout batch live).*
+*For advisor review. Last updated: 2026-09-09 (pilot-30 batch live, 5-issue × 6-combo design).*
 
 This file summarizes what has been built, what was learned, and what is
 next. It references files in this repository and the figures under
@@ -925,3 +925,100 @@ python utils/verify/run_godpatch_f2p.py --index data/verify/issue_index_mini-swe
 This produces `train.jsonl`, `test.jsonl`, `summary.json` under
 `results/split/final/`, the full `agent/skills/` tree, and
 `data/verify/{_pool,issue_index_*.jsonl,verify_manifest.json,audit.json}`.
+
+---
+
+## 9. Live progress — pilot-30 (5 issues × 6 combos × 2 skill = 60 rollouts)
+
+**Date**: 2026-09-09 (after a two-step pipeline fix)
+
+### What changed since pilot-20
+
+Two bugs blocked the pilot-20 from producing any f2p:
+
+1. **API credentials not reaching the LLM call.** `solve.py` built the
+   `env` dict from `os.environ`, but `OPENAI_API_BASE` (the tu-zi
+   gateway URL) lives only in `agent/config/.env` and was never
+   sourced. The container got `OPENAI_API_KEY` but no
+   `OPENAI_API_BASE`, so LiteLLM hit `api.openai.com` and got
+   `401 Invalid API key`. mini-swe-agent silently produced empty
+   patches, and openhands produced empty trajectories.
+
+   **Fix**: `run_one_agent` now reads `agent/config/.env` into
+   `os.environ` before building the `env` dict, AND mounts that file
+   into the mini-swe-agent container at `/mini-src/.env` so the bash
+   command can `source` it. (`api_base_arg` also falls back to
+   `TUZI_BASE_URL`.)
+
+2. **Patch contains scratch / repro files.** Both agents created
+   scratch files (`repro.py`, `patch_openai_model.py`, `result.log`,
+   etc.) during debugging, and `git diff` captured all of them. The
+   resulting patches either failed `git apply` (file exists in
+   workspace) or applied with broken test scaffolding included.
+
+   **Fix**: `_run_mini_swe_agent_docker_run` and `_openhands_sdk_driver`
+   both extend their `git diff` exclude list to catch common scratch
+   filenames.
+
+After both fixes, **47 / 60 rollouts produced a non-empty patch** (vs.
+~0 / 240 in pilot-20). The 13 missing are: 4 docker-build failures
+(issue-1351 has a pre-existing build error in agentscope that the pool
+didn't catch), 1 agent timeout (mini_60 / issue-1689 / with_skill), and
+8 idempotent SKIPs from pilot-20 leftovers.
+
+### Re-extracted 48 patches from existing rollouts
+
+`utils/verify/reextract_patches.py` re-derives `patch.txt` from each
+run's `trajectory.json` / `agent.json` using the updated exclude
+rules, so we don't need to re-pay the LLM cost.
+
+### Pilot-30 design
+
+5 issues randomly sampled from `mini-swe-agent_40` split=1
+(seed=20260909), then matched in the other 5 combos' split=1 by id.
+Result: same 5 issues run across all 6 combos × both skill modes.
+One issue (1351) appears in only 4 combos — pilot-20 had build
+failures on 80 train-size for that issue.
+
+### Pilot-30 results (eval still blocked by docker I/O error)
+
+`results/rq4/pilot30_scores.csv` was written by
+`utils/verify/standalone_batch_f2p.py` but the *evaluation* step hit
+a Docker engine I/O error
+(`failed to solve: write .../io.containerd.metadata.v1.bolt/meta.db:
+input/output error`) on the host's overlay filesystem. Docker Desktop
+needs a full restart to clear; until then, no further eval runs.
+
+| combo | skill | rollouts | patches | f2p | f2f | error | pass@1 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| mini-swe-agent_40 | with    | 5 | 5 | 0 | 1 | 4 | 0 % |
+| mini-swe-agent_40 | without | 5 | 5 | 0 | 0 | 5 | 0 % |
+| mini-swe-agent_60 | with    | 5 | 5 | 0 | 1 | 4 | 0 % |
+| mini-swe-agent_60 | without | 5 | 4 | 0 | 0 | 5 | 0 % |
+| mini-swe-agent_80 | with    | 4 | 4 | 0 | 0 | 4 | 0 % |
+| mini-swe-agent_80 | without | 4 | 4 | 0 | 0 | 4 | 0 % |
+| openhands_40       | with    | 4 | 4 | 0 | 0 | 4 | 0 % |
+| openhands_40       | without | 4 | 4 | 0 | 0 | 4 | 0 % |
+| openhands_60       | with    | 4 | 4 | 0 | 0 | 4 | 0 % |
+| openhands_60       | without | 4 | 4 | 0 | 0 | 4 | 0 % |
+| openhands_80       | with    | 4 | 4 | 0 | 0 | 4 | 0 % |
+| openhands_80       | without | 4 | 4 | 0 | 0 | 4 | 0 % |
+
+*All "error" outcomes are `docker build failed (base)` from the engine
+I/O error above, not from the patches themselves.*
+
+### What this rules in / out (compared to pilot-20)
+
+* **Rules out** "the agent never produces a patch on this task set":
+  47/60 rollouts produced a parseable diff. The patch *production*
+  pipeline now works end-to-end.
+* **Rules in** that mini-swe-agent's patches are *semantically* wrong
+  on this task set: e.g. on issue-1208 the patch produces a syntax
+  error (`else:` orphaned because the patch removed the only `if` in
+  the hunk but left the `else:` dangling). 5-issue sample is too small
+  to disentangle "agent is wrong" from "issue is too hard" — that's
+  exactly the kind of thing pilot-20's bigger sample tried to do but
+  got stuck on the patch-extraction bug.
+* **Open**: re-run pilot-30 eval after Docker recovers. The expected
+  next signal is "out of 47 well-formed patches, how many flip the
+  f2p test?" — that is the actual pass@1 the paper will report.

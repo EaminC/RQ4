@@ -48,3 +48,5 @@ agent/skills/**/*.hallucinated.*
 history.txt
 *.local.txt
 utils/.env
+agent/openhands-sdk/   # local openhands SDK install (large, reproducible)
+logs/                 # per-run logs (large, reproducible)

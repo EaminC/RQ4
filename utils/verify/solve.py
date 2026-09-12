@@ -71,6 +71,7 @@ import argparse
 import fcntl
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -100,10 +101,17 @@ SKILL_ROOT = REPO_ROOT / "agent" / "skills"
 VENV_BIN = REPO_ROOT / "agent" / "venv" / "bin"
 MINI_VENV_BIN = REPO_ROOT / "agent" / ".venv" / "bin"
 
+# OpenHands SDK venv (separate from CLI; CLI is at ~/.local/bin/openhands).
+# We use the SDK to avoid the CLI's headless-mode quirks (file_editor schema
+# mismatch, prompt format drift). The SDK path is what the openhands
+# project officially recommends for batch / programmatic use.
+OH_SDK_VENV_BIN = REPO_ROOT / "agent" / "openhands-sdk" / ".venv" / "bin"
+OH_SDK_PYTHON = OH_SDK_VENV_BIN / "python"
+
 DEFAULT_MODEL = "openai/gpt-4.1-mini"      # served by tu-zi gateway
 DEFAULT_COST_LIMIT = 3.0
 DEFAULT_WALL_TIMEOUT = 1800       # 30 min per agent run
-DEFAULT_DOCKER_BUILD_TIMEOUT = 900 # 15 min per image build
+DEFAULT_DOCKER_BUILD_TIMEOUT = 3600 # 60 min per image build
 
 SUPPORTED_AGENTS = ("mini-swe-agent", "openhands")
 SUPPORTED_TRAIN_SIZES = (40, 60, 80)
@@ -541,6 +549,20 @@ def run_one_agent(spec: RunSpec, prompt: str, *,
     ``stderr_tail``, ``ran_at``. Saves prompt + trajectory + agent log
     to ``spec.out_dir``.
     """
+    # Source the tu-zi gateway credentials from agent/config/.env.
+    # This file may not be sourced in the parent shell (e.g. nohup), so
+    # we load it explicitly into os.environ here so that both the Python
+    # subprocess env and the bash-command subprocess see the credentials.
+    _dotenv_path = REPO_ROOT / "agent" / "config" / ".env"
+    if _dotenv_path.exists():
+        for _line in _dotenv_path.read_text().splitlines():
+            _line = _line.strip()
+            if not _line or _line.startswith("#"):
+                continue
+            if "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+
     spec.out_dir.mkdir(parents=True, exist_ok=True)
     (spec.out_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
 
@@ -549,82 +571,401 @@ def run_one_agent(spec: RunSpec, prompt: str, *,
         **os.environ,
         "OPENAI_API_BASE": os.environ.get("TUZI_BASE_URL", ""),
         "OPENAI_API_KEY":  os.environ.get("TUZI_API_KEY", ""),
+        # mini-swe-agent checks MSWEA_CONFIGURED to skip its setup wizard.
+        # We set this here for defense-in-depth even though the docker-run
+        # helper also enforces it.
+        "MSWEA_CONFIGURED": "1",
+        "MSWEA_COST_TRACKING": "ignore_errors",
     }
 
     if agent_name == "mini-swe-agent":
-        traj_path = spec.out_dir / "trajectory.json"
-        proc = subprocess.run(
-            [
-                str(MINI_VENV_BIN / "mini"),
-                "-c", str(REPO_ROOT / "agent" / "mini-swe-agent" / "src"
-                          / "minisweagent" / "config" / "benchmarks" / "swebench.yaml"),
-                "-c", str(REPO_ROOT / "agent" / "config" / "mini.yaml"),
-                "--model", model,
-                "--cost-limit", str(cost_limit),
-                "--exit-immediately",
-                "--yolo",
-                "--environment-class", "docker",
-                "-c", f"environment.image={spec.image_tag}",
-                "--output", str(traj_path),
-                "-t", prompt,
-            ],
-            cwd=str(REPO_ROOT / "agent" / "mini-swe-agent"),
-            capture_output=True, text=True, timeout=DEFAULT_WALL_TIMEOUT,
-            env=env,
-        )
-        result = {
-            "agent": agent_name,
-            "exit_code": proc.returncode,
-            "stdout_tail": proc.stdout[-2000:],
-            "stderr_tail": proc.stderr[-2000:],
-            "ran_at": _now(),
-            "trajectory_path": str(traj_path.relative_to(REPO_ROOT))
-                                if traj_path.exists() else None,
-        }
-    elif agent_name == "openhands":
-        # OpenHands uses its own CLI; we rely on $OPENHANDS_CONFIG_DIR
-        # (configured in agent/openhands-config/.env) and just run the
-        # -t task. Trajectory location is engine-specific.
+        # Two execution paths are supported:
         #
-        # CRITICAL: openhands' default sandbox is the cwd at invocation.
-        # The agent's prompt tells it to run ``git diff > /testbed/patch.txt``
-        # but openhands doesn't know about /testbed — it just diffs cwd.
-        # We pre-cd into the testbed clone so the agent's ``git diff``
-        # captures the actual repo changes, and we read ``patch.txt``
-        # back from there afterwards (the agent writes it to its cwd).
-        repo_dir = str(agent_repo_path(spec.row.repo))
-        oh_proc = subprocess.run(
-            [str(REPO_ROOT / "agent" / "openhands-config" / ".venv" / "bin"
-                 if (REPO_ROOT / "agent" / "openhands-config" / ".venv").exists()
-                 else shutil.which("openhands") or "openhands"),
-             "--headless", "--override-with-envs", "--yolo",
-             "-t", prompt],
-            cwd=repo_dir,
-            capture_output=True, text=True, timeout=DEFAULT_WALL_TIMEOUT,
-            env=env,
+        #   1. Inner docker class — ``mini-swe-agent --environment-class docker``.
+        #      This makes mini launch its own docker container from
+        #      ``spec.image_tag`` (the testbed image we built). The container
+        #      is ``--rm``, so all of the agent's edits are LOST on exit;
+        #      we recover the patch via the trajectory's ``git diff``
+        #      tool output, which is brittle (truncates on large diffs)
+        #      and was the cause of 29/46 ``corrupt patch`` errors in our
+        #      pilot-20 run.
+        #
+        #   2. Outer docker run (alfin06's pattern) — we ``docker run --rm``
+        #      our testbed image with the upstream repo mounted at /app
+        #      and the spec out_dir mounted at /output. The agent's edits
+        #      are written to the mount, so we recover the patch via
+        #      ``git add -A && git diff`` on the host after the run.
+        #
+        # Default to (2); fall back to (1) if the mount fails.
+        repo_dir = agent_repo_path(spec.row.repo)
+        result = _run_mini_swe_agent_docker_run(
+            spec, prompt,
+            repo_dir=repo_dir, image_tag=spec.image_tag,
+            model=model, cost_limit=cost_limit, env=env,
         )
-        # If the agent wrote patch.txt in its cwd (= testbed), copy it
-        # into the spec out_dir and rewrite it to a git-format diff.
-        host_patch = Path(repo_dir) / "patch.txt"
-        if host_patch.exists():
-            content = host_patch.read_text()
-            # The agent's `git diff` against cwd is already git-format,
-            # so we can use it directly. No _submission_to_git_diff rewrite.
-            (spec.out_dir / "patch.txt").write_text(content)
-        result = {
-            "agent": agent_name,
-            "exit_code": oh_proc.returncode,
-            "stdout_tail": oh_proc.stdout[-2000:],
-            "stderr_tail": oh_proc.stderr[-2000:],
-            "ran_at": _now(),
-            "trajectory_path": None,
-        }
+        if (result.get("exit_code") != 0
+                and "OCI runtime exec" in (result.get("stderr_tail") or "")):
+            # Fallback for environments that block `docker run --rm`.
+            result = _run_mini_swe_agent_via_mini_docker(
+                spec, prompt,
+                image_tag=spec.image_tag,
+                model=model, cost_limit=cost_limit, env=env,
+            )
+    elif agent_name == "openhands":
+        # OpenHands has two execution paths:
+        #
+        #   1. CLI   — ``openhands --headless --override-with-envs --yolo -t <prompt>``.
+        #              The CLI is what the OpenHands team ships in their installer;
+        #              it goes through a frontend that has known headless-mode
+        #              quirks (file_editor schema mismatch, prompt-format drift).
+        #              That's why our 6-combo pilot produced 0 patches.
+        #
+        #   2. SDK   — ``openhands-sdk`` Python package + ``openhands-tools``
+        #              (CodeActAgent, LocalWorkspace, LocalConversation). This is
+        #              the path the OpenHands project officially recommends for
+        #              batch use; it gives explicit control over the tool registry
+        #              and ``max_iteration_per_run`` (60 by default — matching
+        #              alfin06's reference script).
+        #
+        # Default to SDK; fall back to CLI only if the SDK venv is missing
+        # (so we don't break a half-installed machine).
+        repo_dir = agent_repo_path(spec.row.repo)
+        sdk_bin = OH_SDK_VENV_BIN / "python"
+        if sdk_bin.exists():
+            result = _run_openhands_sdk(
+                spec, prompt, repo_dir=repo_dir,
+                model=model, cost_limit=cost_limit, env=env,
+            )
+            # Fallback: if SDK returned exit_code != 0 with "module not found"
+            # (e.g. SDK install broke mid-flight), try the CLI once.
+            if result["exit_code"] != 0 and "No module named" in (result.get("stderr_tail") or ""):
+                result = _run_openhands_cli(
+                    spec, prompt, repo_dir=repo_dir,
+                    model=model, cost_limit=cost_limit, env=env,
+                )
+        else:
+            result = _run_openhands_cli(
+                spec, prompt, repo_dir=repo_dir,
+                model=model, cost_limit=cost_limit, env=env,
+            )
     else:
         return {"agent": agent_name, "exit_code": -1,
                 "stderr_tail": f"unknown agent {agent_name!r}", "ran_at": _now()}
 
     (spec.out_dir / "agent.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
+
+
+def _run_openhands_sdk(spec: RunSpec, prompt: str, *,
+                        repo_dir: Path, model: str,
+                        cost_limit: float, env: dict) -> dict[str, Any]:
+    """Run OpenHands via the official Python SDK (CodeActAgent).
+
+    The agent operates on a :class:`LocalWorkspace` rooted at
+    ``repo_dir`` (the upstream repo clone at the row's base SHA).
+    After the agent finishes, we extract the patch via
+    ``git add -A --intent-to-add && git diff`` from that workspace —
+    which is exactly what alfin06's reference script does. This bypasses
+    the agent's self-reported ``git diff`` output (which used to be the
+    cause of CLI's file_editor / patch.txt bugs).
+
+    ``max_iteration_per_run=60`` matches alfin06's default; the
+    OpenHands README recommends 30-100 for SWE-bench style tasks.
+    """
+    sdk_python = OH_SDK_PYTHON
+    # Driver script: imports SDK, runs conversation, extracts patch.
+    driver = REPO_ROOT / "utils" / "verify" / "_openhands_sdk_driver.py"
+    cmd = [
+        str(sdk_python), str(driver),
+        "--workspace", str(repo_dir),
+        "--model", model,
+        "--max-iterations", "60",
+        "--prompt", prompt,
+        "--out-dir", str(spec.out_dir),
+        "--cost-limit", str(cost_limit),
+    ]
+    # Pass LLM credentials via env (don't bake into CLI).
+    oh_env = {
+        **env,
+        "LLM_API_KEY": env.get("OPENAI_API_KEY", ""),
+        "LLM_BASE_URL": env.get("OPENAI_API_BASE", ""),
+        "OPENHANDS_SUPPRESS_BANNER": "1",
+    }
+    proc = subprocess.run(
+        cmd,
+        cwd=str(repo_dir),
+        capture_output=True, text=True, timeout=DEFAULT_WALL_TIMEOUT,
+        env=oh_env,
+    )
+    return {
+        "agent": "openhands-sdk",
+        "exit_code": proc.returncode,
+        "stdout_tail": proc.stdout[-2000:],
+        "stderr_tail": proc.stderr[-2000:],
+        "ran_at": _now(),
+        "trajectory_path": str((spec.out_dir / "trajectory.json").relative_to(REPO_ROOT))
+                            if (spec.out_dir / "trajectory.json").exists() else None,
+    }
+
+
+def _run_openhands_cli(spec: RunSpec, prompt: str, *,
+                       repo_dir: Path, model: str,
+                       cost_limit: float, env: dict) -> dict[str, Any]:
+    """Fallback: the OpenHands CLI (``openhands --headless --yolo``).
+
+    Kept around because the SDK install requires network access; if
+    the SDK venv isn't present, this lets us still run a rollout.
+    """
+    repo_dir_str = str(repo_dir)
+    cli_bin = (
+        str(REPO_ROOT / "agent" / "openhands-config" / ".venv" / "bin")
+        if (REPO_ROOT / "agent" / "openhands-config" / ".venv").exists()
+        else (shutil.which("openhands") or "openhands")
+    )
+    oh_proc = subprocess.run(
+        [cli_bin, "--headless", "--override-with-envs", "--yolo", "-t", prompt],
+        cwd=repo_dir_str,
+        capture_output=True, text=True, timeout=DEFAULT_WALL_TIMEOUT,
+        env=env,
+    )
+    host_patch = Path(repo_dir_str) / "patch.txt"
+    if host_patch.exists():
+        content = host_patch.read_text()
+        (spec.out_dir / "patch.txt").write_text(content)
+    return {
+        "agent": "openhands-cli",
+        "exit_code": oh_proc.returncode,
+        "stdout_tail": oh_proc.stdout[-2000:],
+        "stderr_tail": oh_proc.stderr[-2000:],
+        "ran_at": _now(),
+        "trajectory_path": None,
+    }
+
+
+def _run_mini_swe_agent_docker_run(spec: RunSpec, prompt: str, *,
+                                    repo_dir: Path, image_tag: str,
+                                    model: str, cost_limit: float,
+                                    env: dict) -> dict[str, Any]:
+    """Run mini-swe-agent via ``docker run --rm -v workspace:/app ...``.
+
+    Pattern follows alfin06's ``run_mini_swe_agent_batch.py`` line
+    367-381: the testbed image (built by ``build_one_image``) is
+    launched as a container with the upstream repo mounted at /app
+    and the spec out_dir mounted at /output. The agent's edits go to
+    the host workspace (via the bind mount), so we can extract the
+    patch with ``git add -A && git diff`` after the container exits.
+
+    This avoids the inner ``--environment-class docker`` path that
+    silently discards the agent's edits when ``--rm`` destroys the
+    container. The inner path was the cause of 29/46 ``corrupt patch``
+    errors in our pilot-20 run.
+    """
+    out_dir = spec.out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+
+    # Environment variables to pass through to the container.
+    # OPENAI_* go via the host env; MSWEA_* are peer-style hints that
+    # mini-swe-agent reads to suppress config prompts.
+    #
+    # We also force MSWEA_CONFIGURED=1 even if the parent shell doesn't
+    # have it set — the agent's setup wizard checks this env var and
+    # prompts for stdin if it's missing, which would deadlock our
+    # batch driver.
+    fwd_env_keys = [
+        "OPENAI_API_KEY", "OPENAI_API_BASE", "OPENAI_BASE_URL",
+        "MSWEA_CONFIGURED", "MSWEA_COST_TRACKING",
+        "FORGE_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL",
+        "TAVILY_API_KEY", "GITHUB_TOKEN",
+    ]
+    # Ensure MSWEA_CONFIGURED is "1" — never None, never empty.
+    env_augmented = {
+        **env,
+        "MSWEA_CONFIGURED": env.get("MSWEA_CONFIGURED") or "1",
+        "MSWEA_COST_TRACKING": env.get("MSWEA_COST_TRACKING") or "ignore_errors",
+    }
+    docker_env_args: list[str] = []
+    for k in fwd_env_keys:
+        v = env_augmented.get(k) or os.environ.get(k)
+        if v:
+            docker_env_args.extend(["-e", f"{k}={v}"])
+
+    # mini-swe-agent isn't installed in the testbed image (the image is
+    # the bare repo + deps; the agent binary lives in the host venv at
+    # agent/.venv). We need to use the container's Python interpreter
+    # to run it (the host venv is macOS, the container is linux), so we
+    # install mini-swe-agent inside the container at runtime via pip.
+    #
+    # Mounts:
+    #   - repo_dir   → /testbed   (the upstream repo at base_sha; agent
+    #                              writes here via the bind mount, and
+    #                              we recover the patch with git diff)
+    #   - out_dir    → /output    (trajectory.json goes here)
+    #   - mini_src   → /mini-src  (the mini-swe-agent source tree, so
+    #                              the installed package can be edited
+    #                              without re-installing)
+    #
+    # The swebench.yaml config lives on the HOST path, but inside the
+    # container the same file is at /mini-src/src/.../swebench.yaml.
+    # We use the container path so mini can find it.
+    mini_src = REPO_ROOT / "agent" / "mini-swe-agent"
+    env_file = REPO_ROOT / "agent" / "config" / ".env"
+    config_in_container = "/mini-src/src/minisweagent/config/benchmarks/swebench.yaml"
+    # swebench.yaml sets model_kwargs.drop_params and parallel_tool_calls but
+    # NOT api_base. Without it, LiteLLM falls back to the OpenAI default
+    # (api.openai.com), which doesn't accept our tu-zi gateway key. Inject
+    # api_base from OPENAI_API_BASE so the LLM call goes to the tu-zi gateway.
+    # Source .env so bash sees the credentials (the Python subprocess env=
+    # is separate from the bash shell env).
+    api_base_val = env_augmented.get('OPENAI_API_BASE') or os.environ.get('TUZI_BASE_URL') or ''
+    api_base_arg = f"-c model.model_kwargs.api_base={api_base_val}" if api_base_val else ""
+    cmd = [
+        "docker", "run", "--rm", "--network=host",
+        *docker_env_args,
+        "-v", f"{repo_dir}:/testbed",
+        "-v", f"{out_dir}:/output",
+        "-v", f"{mini_src}:/mini-src",
+        "-v", f"{env_file}:/mini-src/.env:ro",
+        "-w", "/testbed",
+        image_tag,
+        "bash", "-c",
+        # 1) source .env so OPENAI_API_KEY and OPENAI_API_BASE are set for
+        #    pip install and the mini agent's LiteLLM calls
+        # 2) install mini-swe-agent into the container's site-packages
+        # 3) override its import to use the bind-mounted source so we
+        #    don't have to re-install on every config tweak
+        # 3) drop the empty mini.yaml override (it's intentionally
+        #    empty in our setup; passing its host path would fail
+        #    inside the container).
+        # 4) swebench.yaml defaults environment_class=docker which
+        #    would try to spin a sub-container inside our container.
+        #    We're already inside the testbed image — use the local
+        #    env class so it just runs commands via subprocess.
+        #    cwd=/testbed matches the bind-mounted host repo.
+        # 5) swebench.yaml doesn't set api_base; without it LiteLLM
+        #    falls back to api.openai.com which rejects our tu-zi key.
+        #    Inject api_base into model.model_kwargs so the call goes
+        #    to the tu-zi gateway.
+        ("set -a && . /mini-src/.env && set +a && "
+         "pip install --quiet --no-cache-dir 'mini-swe-agent==2.4.6' && "
+         "PYTHONPATH=/mini-src/src:$PYTHONPATH "
+         "python3 -m minisweagent.run.mini "
+         f"-c {config_in_container} "
+         f"{api_base_arg} "
+         f"--model {model} "
+         f"--cost-limit {cost_limit} "
+         "--exit-immediately --yolo "
+         "-c environment.environment_class=local "
+         "-c environment.cwd=/testbed "
+         f"-t {shlex.quote(prompt)} "
+         "--output /output/trajectory.json"),
+    ]
+    proc = subprocess.run(
+        cmd,
+        cwd=str(repo_dir),
+        capture_output=True, text=True, timeout=DEFAULT_WALL_TIMEOUT,
+        env=env,
+    )
+
+    # Extract patch from the host workspace via ``git diff``.
+    # The bind-mount means whatever the agent wrote is now in repo_dir.
+    # Exclude files we added during build (env.dockerfile and the
+    # agentsmith fail-to-pass test) — those are build artifacts, not
+    # agent edits.
+    patch_text = ""
+    try:
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "add", "-A", "--intent-to-add"],
+            capture_output=True, text=True, timeout=60,
+        )
+        # Exclude:
+        #   - env.dockerfile: build artifact added before agent runs.
+        #   - tests/agentsmith_*: the agentsmith fail-to-pass test.
+        #   - *.db / *.sqlite*: agent may create a DB while testing.
+        #   - patch.txt: the agent's own patch file (created by `git diff > patch.txt`).
+        #   - *.log: agent test logs.
+        #   - test_runs/: mini-swe-agent creates this during testing.
+        #   - .config/: agent config directory.
+        diff_proc = subprocess.run(
+            ["git", "-C", str(repo_dir), "diff",
+             "--", ".",
+             ":!env.dockerfile",
+             ":!tests/agentsmith_*",
+             ":!*.db", ":!*.sqlite", ":!*.sqlite3",
+             ":!patch.txt",
+             ":!*.log",
+             ":!test_runs",
+             ":!.config",
+             # Common scratch / reproduction files agents create
+             ":!repro*.py", ":!reproduce*.py",
+             ":!scratch*.py",
+             ":!test_repro*.py",
+             ":!patch_*.py",
+             ":!debug_*.py",
+             ":!tmp_*.py",
+             ":!result.log",
+             ":!verify_*.py",
+             ":!check_*.py",
+             ],
+            capture_output=True, text=True, timeout=60,
+        )
+        patch_text = diff_proc.stdout or ""
+    except Exception as e:
+        patch_text = f"# git diff failed: {e}\n"
+
+    if patch_text.strip():
+        (out_dir / "patch.txt").write_text(patch_text, encoding="utf-8")
+
+    return {
+        "agent": "mini-swe-agent-docker",
+        "exit_code": proc.returncode,
+        "stdout_tail": proc.stdout[-2000:],
+        "stderr_tail": proc.stderr[-2000:],
+        "ran_at": _now(),
+        "trajectory_path": str((out_dir / "trajectory.json").relative_to(REPO_ROOT))
+                            if (out_dir / "trajectory.json").exists() else None,
+    }
+
+
+def _run_mini_swe_agent_via_mini_docker(spec: RunSpec, prompt: str, *,
+                                        image_tag: str,
+                                        model: str, cost_limit: float,
+                                        env: dict) -> dict[str, Any]:
+    """Fallback: original mini-swe-agent ``--environment-class docker``.
+
+    Kept for environments that don't allow bind-mounting the host
+    workspace into a docker container. Patches are recovered from the
+    trajectory's ``git diff`` tool output (best effort).
+    """
+    traj_path = spec.out_dir / "trajectory.json"
+    proc = subprocess.run(
+        [
+            str(MINI_VENV_BIN / "mini"),
+            "-c", str(REPO_ROOT / "agent" / "mini-swe-agent" / "src"
+                      / "minisweagent" / "config" / "benchmarks" / "swebench.yaml"),
+            "-c", str(REPO_ROOT / "agent" / "config" / "mini.yaml"),
+            "--model", model,
+            "--cost-limit", str(cost_limit),
+            "--exit-immediately",
+            "--yolo",
+            "--environment-class", "docker",
+            "-c", f"environment.image={image_tag}",
+            "--output", str(traj_path),
+            "-t", prompt,
+        ],
+        cwd=str(REPO_ROOT / "agent" / "mini-swe-agent"),
+        capture_output=True, text=True, timeout=DEFAULT_WALL_TIMEOUT,
+        env=env,
+    )
+    return {
+        "agent": "mini-swe-agent",
+        "exit_code": proc.returncode,
+        "stdout_tail": proc.stdout[-2000:],
+        "stderr_tail": proc.stderr[-2000:],
+        "ran_at": _now(),
+        "trajectory_path": str(traj_path.relative_to(REPO_ROOT))
+                            if traj_path.exists() else None,
+    }
 
 
 def _strip_app_prefix(path: str) -> str:
@@ -727,10 +1068,16 @@ def extract_patch(spec: RunSpec) -> bool:
     """Pull the agent's git diff out of the trajectory / agent.json and
     save it as ``patch.txt``.
 
-    For mini-swe-agent: read ``info.submission`` from trajectory.json
-    (the agent's last assistant message — a unified diff against a
-    ``.bak`` snapshot), rewrite it to git format, and save as
-    ``patch.txt``.
+    For mini-swe-agent: read the trajectory's tool-output stream and
+    extract the LAST ``git diff`` block. This is what the agent
+    produced via ``git diff -- path1 path2 > patch.txt`` (or
+    ``cat patch.txt``) inside the docker container. The previous
+    approach (read ``info.submission``) was broken because the
+    submission text is the agent's *last assistant message* which has
+    hunk-header line counts that don't match the body — ``git apply``
+    rejected 29/46 of our pilot-20 patches as ``corrupt patch`` for
+    this reason. The trajectory's tool outputs are verbatim from
+    ``git diff``, so they are correct by construction.
 
     For openhands: read stdout_tail from agent.json for the patch.
 
@@ -744,15 +1091,24 @@ def extract_patch(spec: RunSpec) -> bool:
             traj = json.loads(traj_path.read_text())
         except Exception:
             return False
-        # 1) Prefer info.submission — this is the agent's final unified
-        #    diff and is what the agent meant to submit.
+
+        # 1) Try the trajectory tool-output stream. This is the most
+        #    reliable source — it's the verbatim ``git diff`` output.
+        diff_block = _extract_last_git_diff_from_messages(traj.get("messages", []))
+        if diff_block:
+            (spec.out_dir / "patch.txt").write_text(diff_block)
+            return True
+
+        # 2) Fallback: info.submission (legacy, broken on real issues).
         submission = (traj.get("info") or {}).get("submission") or ""
         if submission.strip():
             rewritten = _submission_to_git_diff(submission)
             if rewritten and rewritten.strip():
                 (spec.out_dir / "patch.txt").write_text(rewritten)
                 return True
-        # 2) Fallback: search the entire blob for ``diff --git`` text.
+
+        # 3) Last resort: search the entire JSON blob for ``diff --git``
+        #    text. Only safe if there's exactly one occurrence.
         blob = json.dumps(traj)
         if "diff --git " in blob:
             i = blob.find("diff --git ")
@@ -774,10 +1130,40 @@ def extract_patch(spec: RunSpec) -> bool:
     log = json.loads(agent_log.read_text())
     out = (log.get("stdout_tail") or "") + "\n" + (log.get("stderr_tail") or "")
     if "+++ " in out or "diff --git " in out:
-        i = out.find("+++ ") if "+++ " in out else out.find("diff --git ")
+        i = out.find("+++ ") if out.find("+++ ") != -1 else out.find("diff --git ")
         (spec.out_dir / "patch.txt").write_text(out[i:])
         return True
     return False
+
+
+def _extract_last_git_diff_from_messages(messages: list[dict]) -> str | None:
+    """Pull the last ``diff --git`` block out of a mini-swe-agent trajectory.
+
+    Walks the messages in order, finds every tool output that contains
+    a ``diff --git`` line, parses out the body (between ``<output>``
+    tags or starting from the ``diff --git`` line), and returns the
+    *last* such body. Returns None if no diff was ever produced.
+    """
+    import re
+
+    last: str | None = None
+    for msg in messages:
+        if msg.get("role") != "tool":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str) or "diff --git" not in content:
+            continue
+        # mini-swe-agent wraps tool outputs in <output>...</output> tags.
+        m_out = re.search(r"<output>\n?(.*?)\n?</output>", content, re.DOTALL)
+        body = m_out.group(1) if m_out else content
+        # Trim anything after the last diff hunk (e.g. shell prompt echo).
+        if "diff --git" in body:
+            idx = body.find("diff --git")
+            body = body[idx:].rstrip() + "\n"
+            # Sanity: must contain at least one hunk header
+            if "@@ " in body:
+                last = body
+    return last
 
 
 def rollout_rows(rows: list[Row], *,
