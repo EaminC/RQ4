@@ -1172,7 +1172,8 @@ def rollout_rows(rows: list[Row], *,
                  cost_limit: float,
                  max_rows: int | None = None,
                  skip_done: bool = True,
-                 dry_build_only: bool = False) -> dict[str, int]:
+                 dry_build_only: bool = False,
+                 cleanup_images: bool = False) -> dict[str, int]:
     """Top-level orchestration loop.
 
     Steps per (row, skill_mode):
@@ -1180,6 +1181,11 @@ def rollout_rows(rows: list[Row], *,
         2. Build docker image (only once per row, regardless of skill_mode).
         3. If ``dry_build_only``, stop here.
         4. For each skill_mode: build prompt, invoke agent, extract patch.
+
+    If ``cleanup_images`` is True, the row's image is removed once *all*
+    skill_modes finish successfully (or the build failed). Images are
+    not removed if the build was cached from a prior batch — in that
+    case another batch may still need them.
 
     Returns a stats dict ``{built, skipped, ok, failed, error}``.
     """
@@ -1276,7 +1282,27 @@ def rollout_rows(rows: list[Row], *,
                     {"ran_at": _now()}, indent=2))
                 print(f"    ✗ no patch extracted")
 
+        # Per-row image cleanup — only for images we *built* in this
+        # call. Cached images (image_meta.json existed before this
+        # call) are left in place so other batches can still reuse them.
+        if cleanup_images and image_meta_path.exists() and 'image_meta' in dir():
+            if image_meta.get("ok"):
+                _cleanup_image(build_tag)
+
     return stats
+
+
+def _cleanup_image(tag: str) -> None:
+    """Best-effort ``docker image rm`` for one tag. Errors are logged
+    but do not abort the batch — the run artifacts are on disk already."""
+    try:
+        subprocess.run(
+            ["docker", "image", "rm", tag],
+            check=False, capture_output=True, text=True, timeout=300,
+        )
+        print(f"  · docker image rm {tag}")
+    except Exception as e:
+        print(f"  · docker image rm {tag} skipped: {e!r}")
 
 
 def cmd_status(rows: Iterable[Row], *, skill_modes: list[bool]) -> int:
@@ -1347,12 +1373,37 @@ def main() -> None:
                     help="Re-run even if patch.txt exists.")
     ro.add_argument("--build-only", action="store_true",
                     help="Only build docker images, skip agent runs.")
+    ro.add_argument("--cleanup-images", action="store_true",
+                    help="After each row finishes both skill modes, "
+                         "remove its docker image tag. Saves ~1-3 GB per "
+                         "row but disables cross-batch image reuse.")
 
     score = sub.add_parser("score",
                            help="Apply patch + run test for prior runs.")
     add_io(score)
 
+    prune = sub.add_parser("prune-images",
+                           help="Remove every rq4-* docker image.")
+    prune.add_argument("--dry-run", action="store_true",
+                       help="List what would be removed, do not remove.")
+    prune.add_argument("--repo", type=str, default=None,
+                       help="Only remove images for this repo "
+                            "(e.g. 'crewAIInc/crewAI').")
+    prune.add_argument("--older-than-days", type=int, default=None,
+                       help="Only remove images older than N days "
+                            "(based on image_meta.json built_at).")
+
     args = p.parse_args()
+
+    # prune-images does not need --index (it iterates image_meta.json
+    # under the runs root directly), so handle it before that check.
+    if args.mode == "prune-images":
+        return cmd_prune_images(
+            repo=args.repo,
+            older_than_days=args.older_than_days,
+            dry_run=args.dry_run,
+        )
+
     if not args.index.exists():
         sys.exit(f"--index {args.index} does not exist")
 
@@ -1382,6 +1433,7 @@ def main() -> None:
             max_rows=args.max_rows,
             skip_done=not args.no_skip_done,
             dry_build_only=args.build_only,
+            cleanup_images=args.cleanup_images,
         )
         print()
         print(json.dumps(stats, indent=2))
@@ -1390,6 +1442,91 @@ def main() -> None:
     if args.mode == "score":
         sys.exit("score not implemented in this commit; see TODO in solve.py")
 
+    return 0
+
+
+def cmd_prune_images(*, repo: str | None,
+                     older_than_days: int | None,
+                     dry_run: bool) -> int:
+    """Remove ``rq4-*`` docker images, optionally filtered by repo and
+    age. Iterates over ``image_meta.json`` files so we know which tags
+    exist on disk and when they were built, then asks the Docker CLI
+    to remove them.
+
+    Use this when one repo finishes — e.g. after a pilot — to free
+    disk space before starting the next pilot. ``rollout --cleanup-images``
+    does this per row; ``prune-images`` does it in bulk.
+    """
+    if not RUNS_ROOT.exists():
+        print(f"runs root {RUNS_ROOT} does not exist; nothing to prune.")
+        return 0
+
+    cutoff_ts: float | None = None
+    if older_than_days is not None:
+        cutoff_ts = time.time() - older_than_days * 86400
+
+    safe_repo_filter: str | None = None
+    if repo:
+        if "/" not in repo:
+            print(f"--repo expects 'owner/name', got {repo!r}", file=sys.stderr)
+            return 2
+        safe_repo_filter = repo.replace("/", "__").lower()
+
+    targets: list[tuple[str, float]] = []  # (tag, built_at_ts)
+    for meta_path in RUNS_ROOT.glob("*/*/image_meta.json"):
+        try:
+            meta = json.loads(meta_path.read_text())
+        except Exception:
+            continue
+        tag = meta.get("tag")
+        built_at = meta.get("built_at", "")
+        if not tag:
+            continue
+        # Filter by repo.
+        if safe_repo_filter and safe_repo_filter not in tag.lower():
+            continue
+        # Filter by age.
+        if cutoff_ts is not None:
+            try:
+                from datetime import datetime
+                ts = datetime.fromisoformat(built_at).timestamp()
+            except Exception:
+                continue
+            if ts > cutoff_ts:
+                continue
+        targets.append((tag, ts))
+
+    if not targets:
+        print("no matching images to prune.")
+        return 0
+
+    print(f"{len(targets)} image(s) match:")
+    for tag, _ in targets:
+        print(f"  {tag}")
+
+    if dry_run:
+        print("(dry-run) no images removed.")
+        return 0
+
+    removed = 0
+    for tag, _ in targets:
+        r = subprocess.run(
+            ["docker", "image", "rm", tag],
+            check=False, capture_output=True, text=True, timeout=300,
+        )
+        if r.returncode == 0:
+            removed += 1
+            print(f"  ✓ removed {tag}")
+        else:
+            err = r.stderr.strip() or r.stdout.strip() or "(no output)"
+            print(f"  ✗ {tag}: {err.splitlines()[0] if err else 'unknown'}")
+
+    # Also prune dangling layers so the daemon reclaims the disk space.
+    subprocess.run(
+        ["docker", "image", "prune", "-f"],
+        check=False, capture_output=True, text=True, timeout=300,
+    )
+    print(f"removed {removed}/{len(targets)} image(s).")
     return 0
 
 
